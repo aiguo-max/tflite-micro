@@ -46,6 +46,13 @@ struct OpDataConv {
   int32_t output_activation_min;
   int32_t output_activation_max;
 
+  bool is_hybrid;
+  int hybrid_input_scratch_index;
+  int hybrid_output_scratch_index;
+  const float* hybrid_filter_scales;
+  int hybrid_num_channels;
+  const int32_t* hybrid_row_sums;  // precomputed per-channel filter row sums
+
   // A buffer used to store unpacked filter values. This is used if the source
   // tensor is of n-bit precision that cannot be easily processed by kernels.
   int filter_buffer_index;

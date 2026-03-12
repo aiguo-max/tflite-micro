@@ -74,7 +74,9 @@ ConvParams ConvParamsQuantized(const TfLiteConvParams& params,
 
 void* ConvInit(TfLiteContext* context, const char* buffer, size_t length) {
   TFLITE_DCHECK(context->AllocatePersistentBuffer != nullptr);
-  return context->AllocatePersistentBuffer(context, sizeof(OpDataConv));
+  void* raw = context->AllocatePersistentBuffer(context, sizeof(OpDataConv));
+  memset(raw, 0, sizeof(OpDataConv));
+  return raw;
 }
 
 TfLiteStatus CalculateOpDataConv(TfLiteContext* context, TfLiteNode* node,
@@ -156,13 +158,16 @@ TfLiteStatus ConvPrepare(TfLiteContext* context, TfLiteNode* node) {
   TF_LITE_ENSURE(context, filter != nullptr);
 
   TF_LITE_ENSURE_EQ(context, input->type, output->type);
+  data->is_hybrid =
+      (input->type == kTfLiteFloat32 && filter->type == kTfLiteInt8);
   TF_LITE_ENSURE_MSG(
       context,
-      (input->type == kTfLiteFloat32 && filter->type == kTfLiteFloat32) ||
+      (input->type == kTfLiteFloat32 &&
+       (filter->type == kTfLiteFloat32 || filter->type == kTfLiteInt8)) ||
           (input->type == kTfLiteInt16 && filter->type == kTfLiteInt8) ||
           (input->type == kTfLiteInt8 &&
            (filter->type == kTfLiteInt4 || filter->type == kTfLiteInt8)),
-      "Hybrid models are not supported on TFLite Micro.");
+      "Unsupported input/filter type combination.");
 
   const int input_width = input->dims->data[2];
   const int input_height = input->dims->data[1];
@@ -208,6 +213,24 @@ TfLiteStatus ConvPrepare(TfLiteContext* context, TfLiteNode* node) {
             .FlatSize();
     context->RequestScratchBufferInArena(context, filter_size,
                                          &data->filter_buffer_index);
+  }
+
+  if (data->is_hybrid) {
+    int input_size =
+        RuntimeShape(input->dims->size,
+                     reinterpret_cast<const int32_t*>(input->dims->data))
+            .FlatSize();
+    context->RequestScratchBufferInArena(
+        context, input_size * sizeof(int8_t), &data->hybrid_input_scratch_index);
+
+    const auto* aq =
+        static_cast<TfLiteAffineQuantization*>(filter->quantization.params);
+    data->hybrid_num_channels = aq->scale->size;
+    float* scales_copy = static_cast<float*>(context->AllocatePersistentBuffer(
+        context, aq->scale->size * sizeof(float)));
+    memcpy(scales_copy, aq->scale->data, aq->scale->size * sizeof(float));
+    data->hybrid_filter_scales = scales_copy;
+    data->hybrid_row_sums = nullptr;
   }
 
 #ifdef USE_TFLM_COMPRESSION
