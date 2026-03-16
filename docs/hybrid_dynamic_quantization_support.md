@@ -84,21 +84,32 @@ arm_nn_mat_mult_nt_t_s8_s32(
 
 ### 3.4 Conv2D 参数映射（per-row im2col）
 
-Conv2D 需要先做 im2col 将卷积转换为矩阵乘法，按输出行处理以节省内存：
+传统 im2col 将整个卷积展开为一次大矩阵乘法，临时矩阵大小为 `batch × out_h × out_w × kernel_h × kernel_w × in_ch`，同一输入元素会被复制 `kernel_size` 次。对于长序列或大卷积核，这个工作区在 MCU 上很容易超出可用 SRAM。
+
+本实现采用 **per output row** 策略：每次只对一行输出做 im2col，立即执行 matmul 和 dequantize，然后复用 buffer 处理下一行。
+
+```
+全量 im2col buffer:  batch × out_h × out_w × patch_size
+per-row buffer:      out_w × patch_size                    ← 小 batch × out_h 倍
+```
+
+具体示例（`out_h=32, out_w=32, kernel=3×3, in_ch=128, batch=1`）：
+
+| 方案 | im2col 大小 | 比例 |
+|------|------------|------|
+| 全量 im2col | 1 × 32 × 32 × 1152 = **1,179,648 B** | 1× |
+| Per-row | 32 × 1152 = **36,864 B** | **1/32** |
+
+代价是 matmul 调用次数从 1 次变为 `batch × out_h` 次，但每次调用仍然能利用 MVE SIMD 加速，实测整体仍获得 11.3× 加速。
 
 ```c
-// 对每个 output row:
-// 1. im2col: [output_width × patch_size]
-// 2. matmul:
-arm_nn_mat_mult_nt_t_s8_s32(
-    im2col,            // [output_width × patch_size]
-    filter_int8,       // [output_depth × patch_size]
-    int32_output,      // [output_width × output_depth]
-    output_width,      // lhs_rows
-    patch_size,        // rhs_rows (= filter_h × filter_w × input_depth)
-    output_depth,      // rhs_cols
-    0,                 // lhs_offset
-    1);                // dst_idx_offset
+for each batch, for each out_y:
+    // 1. im2col 当前行: [output_width × patch_size]
+    // 2. matmul:
+    arm_nn_mat_mult_nt_t_s8_s32(
+        im2col, filter_int8, int32_output,
+        output_width, patch_size, output_depth, 0, 1);
+    // 3. dequantize + bias + activation → output[batch][out_y][:]
 ```
 
 ## 4. 修改的文件
@@ -222,11 +233,23 @@ make -f tensorflow/lite/micro/tools/make/Makefile \
 - 编译时条件编译是 TFLM 中 CMSIS-NN 优化的标准模式
 - 保持与现有 int8/int16 kernel 的一致性
 
-### 8.2 为什么 Conv2D 按行做 im2col
+### 8.2 为什么 Conv2D 按行做 im2col（Per-Row Im2col）
 
-- 全量 im2col 需要 `output_h × output_w × patch_size` 字节，对大特征图内存开销过大
-- 按行处理只需 `output_w × patch_size` 字节，内存节省 `output_h` 倍
-- 每行仍然可以利用 CMSIS-NN 的 SIMD 加速
+这是本实现的一个关键设计点。
+
+**问题**：显式 im2col 会把同一输入元素复制 `kernel_size` 次，全量 im2col 的临时矩阵大小为 `batch × out_h × out_w × kernel_h × kernel_w × in_ch`。对于长序列或大卷积核，这个工作区在 MCU 的有限 SRAM 中很容易溢出。
+
+**方案**：按 output row 分片处理，每次只展开一行输出对应的 im2col patch，立即执行 matmul + dequantize，然后复用同一块 buffer。
+
+**优势**：
+- 内存：scratch buffer 从 `O(out_h × out_w × patch_size)` 降为 `O(out_w × patch_size)`，节省 `out_h` 倍
+- 正确性：每行独立处理，无数据依赖，结果与全量 im2col 完全一致
+- 性能：每次 matmul 的 `lhs_rows = out_w` 仍然足够大，MVE 向量化效率不受显著影响
+
+**权衡**：
+- matmul 调用次数增加 `out_h` 倍，带来少量函数调用开销
+- 如果 `out_w` 很小（如 1），每次 matmul 的向量化效率会降低
+- 极端情况下可进一步拆为 per-pixel，但会完全失去 matmul 批量加速优势
 
 ### 8.3 为什么 hybrid eval 放在 `_common.cc`
 
