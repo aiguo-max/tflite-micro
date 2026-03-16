@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "tensorflow/lite/micro/kernels/conv.h"
 
+#include <cstring>
+
 #include "Include/arm_nnfunctions.h"
 #include "tensorflow/lite/c/builtin_op_data.h"
 #include "tensorflow/lite/c/common.h"
@@ -39,7 +41,9 @@ struct OpData {
 
 void* Init(TfLiteContext* context, const char* buffer, size_t length) {
   TFLITE_DCHECK(context->AllocatePersistentBuffer != nullptr);
-  return context->AllocatePersistentBuffer(context, sizeof(OpData));
+  void* raw = context->AllocatePersistentBuffer(context, sizeof(OpData));
+  memset(raw, 0, sizeof(OpData));
+  return raw;
 }
 
 TfLiteStatus Prepare(TfLiteContext* context, TfLiteNode* node) {
@@ -75,10 +79,14 @@ TfLiteStatus Prepare(TfLiteContext* context, TfLiteNode* node) {
   TF_LITE_ENSURE_MSG(
       context,
       (input->type == kTfLiteFloat32 && filter->type == kTfLiteFloat32) ||
+          (input->type == kTfLiteFloat32 && filter->type == kTfLiteInt8) ||
           (input->type == kTfLiteInt16 && filter->type == kTfLiteInt8) ||
           (input->type == kTfLiteInt8 &&
            (filter->type == kTfLiteInt4 || filter->type == kTfLiteInt8)),
-      "Hybrid models are not supported on TFLite Micro.");
+      "Input/filter type combination not supported on TFLite Micro.");
+
+  data->reference_op_data.is_hybrid =
+      (input->type == kTfLiteFloat32 && filter->type == kTfLiteInt8);
 
   // Consistency check tensor dims
   // Dimensionality
@@ -133,6 +141,39 @@ TfLiteStatus Prepare(TfLiteContext* context, TfLiteNode* node) {
       context, node, params, input_dims.w, input_dims.h, filter_dims.w,
       filter_dims.h, output_dims.w, output_dims.h, input->type,
       &data->reference_op_data));
+
+  if (data->reference_op_data.is_hybrid) {
+    const auto* aq =
+        static_cast<TfLiteAffineQuantization*>(filter->quantization.params);
+    TF_LITE_ENSURE(context, aq != nullptr);
+    TF_LITE_ENSURE(context, aq->scale != nullptr);
+
+    const int input_size =
+        RuntimeShape(input->dims->size,
+                     reinterpret_cast<const int32_t*>(input->dims->data))
+            .FlatSize();
+    TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
+        context, input_size * sizeof(int8_t),
+        &data->reference_op_data.hybrid_input_scratch_index));
+    data->reference_op_data.hybrid_num_channels = aq->scale->size;
+    float* scales_copy = static_cast<float*>(
+        context->AllocatePersistentBuffer(context,
+                                          aq->scale->size * sizeof(float)));
+    memcpy(scales_copy, aq->scale->data, aq->scale->size * sizeof(float));
+    data->reference_op_data.hybrid_filter_scales = scales_copy;
+    data->reference_op_data.hybrid_row_sums = nullptr;
+
+    // Allocate im2col scratch: one output row of patches
+    const int patch_size = filter_dims.h * filter_dims.w * input_dims.c;
+    TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
+        context, output_dims.w * patch_size * sizeof(int8_t),
+        &data->reference_op_data.hybrid_im2col_scratch_index));
+
+    // Allocate int32 output scratch: one output row
+    TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
+        context, output_dims.w * output_dims.c * sizeof(int32_t),
+        &data->reference_op_data.hybrid_output_scratch_index));
+  }
 
   // CMSIS_NN allows INT64 or nullptr bias data pointer
   if (input->type == kTfLiteInt8 ||
@@ -419,12 +460,19 @@ TfLiteStatus Eval(TfLiteContext* context, TfLiteNode* node) {
   TF_LITE_ENSURE_MSG(
       context,
       input->type == filter->type ||
+          (input->type == kTfLiteFloat32 && filter->type == kTfLiteInt8) ||
           (input->type == kTfLiteInt16 && filter->type == kTfLiteInt8) ||
           (input->type == kTfLiteInt8 && filter->type == kTfLiteInt4),
-      "Hybrid models are not supported on TFLite Micro.");
+      "Input/filter type combination not supported on TFLite Micro.");
 
   switch (input->type) {  // Already know in/out types are same.
     case kTfLiteFloat32: {
+      if (data.reference_op_data.is_hybrid) {
+        const auto& conv_params =
+            *(reinterpret_cast<const TfLiteConvParams*>(node->builtin_data));
+        return ConvEvalHybrid(context, conv_params, data.reference_op_data,
+                              input, filter, bias, output);
+      }
       tflite::reference_ops::Conv(
           ConvParamsFloat(params, data.reference_op_data),
           tflite::micro::GetTensorShape(input),

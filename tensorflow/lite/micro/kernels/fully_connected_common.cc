@@ -13,6 +13,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+
 #include "tensorflow/lite/c/builtin_op_data.h"
 #include "tensorflow/lite/c/common.h"
 #include "tensorflow/lite/kernels/internal/common.h"
@@ -24,7 +28,112 @@ limitations under the License.
 #include "tensorflow/lite/micro/kernels/fully_connected.h"
 #include "tensorflow/lite/micro/kernels/kernel_util.h"
 
+#if defined(CMSIS_NN)
+#include "Include/arm_nnsupportfunctions.h"
+#endif
+
 namespace tflite {
+
+TfLiteStatus FullyConnectedEvalHybrid(
+    TfLiteContext* context,
+    const TfLiteFullyConnectedParams& params,
+    const OpDataFullyConnected& data,
+    const TfLiteEvalTensor* input,
+    const TfLiteEvalTensor* filter,
+    const TfLiteEvalTensor* bias,
+    TfLiteEvalTensor* output) {
+  const int8_t* filter_int8 = tflite::micro::GetTensorData<int8_t>(filter);
+  const float* input_data = tflite::micro::GetTensorData<float>(input);
+  const float* bias_float = tflite::micro::GetOptionalTensorData<float>(bias);
+  float* output_data = tflite::micro::GetTensorData<float>(output);
+
+  const RuntimeShape& input_shape = tflite::micro::GetTensorShape(input);
+  const RuntimeShape& filter_shape = tflite::micro::GetTensorShape(filter);
+
+  const int input_size = input_shape.FlatSize();
+  int8_t* input_quantized = static_cast<int8_t*>(
+      context->GetScratchBuffer(context, data.hybrid_input_scratch_index));
+
+  float min_val = input_data[0];
+  float max_val = input_data[0];
+  for (int i = 1; i < input_size; ++i) {
+    if (input_data[i] < min_val) min_val = input_data[i];
+    if (input_data[i] > max_val) max_val = input_data[i];
+  }
+
+  const float range = std::max(std::abs(min_val), std::abs(max_val));
+  float input_scale;
+  if (range == 0.0f) {
+    input_scale = 1.0f;
+    memset(input_quantized, 0, input_size * sizeof(int8_t));
+  } else {
+    input_scale = range / 127.0f;
+    const float inv_scale = 127.0f / range;
+    for (int i = 0; i < input_size; ++i) {
+      int32_t v = static_cast<int32_t>(input_data[i] * inv_scale +
+                  (input_data[i] >= 0.0f ? 0.5f : -0.5f));
+      v = v < -127 ? -127 : (v > 127 ? 127 : v);
+      input_quantized[i] = static_cast<int8_t>(v);
+    }
+  }
+
+  const int output_depth = filter_shape.Dims(0);
+  const int accum_depth = filter_shape.Dims(1);
+  const int batches = input_size / accum_depth;
+
+  FullyConnectedParams op_params = FullyConnectedParamsFloat(params.activation);
+  const float act_min = op_params.float_activation_min;
+  const float act_max = op_params.float_activation_max;
+
+#if defined(CMSIS_NN)
+  // CMSIS-NN accelerated path: int8 matmul with MVE/DSP acceleration
+  int32_t* int32_output = static_cast<int32_t*>(
+      context->GetScratchBuffer(context, data.hybrid_output_scratch_index));
+  memset(int32_output, 0, batches * output_depth * sizeof(int32_t));
+
+  arm_nn_mat_mult_nt_t_s8_s32(
+      input_quantized,  // lhs: [batches x accum_depth]
+      filter_int8,      // rhs: [output_depth x accum_depth]
+      int32_output,     // dst: [batches x output_depth]
+      batches,          // lhs_rows
+      accum_depth,      // rhs_rows
+      output_depth,     // rhs_cols
+      0,                // lhs_offset (symmetric quantization)
+      1);               // dst_idx_offset (contiguous)
+
+  for (int b = 0; b < batches; ++b) {
+    for (int out_c = 0; out_c < output_depth; ++out_c) {
+      float float_acc = int32_output[b * output_depth + out_c] *
+                        input_scale * data.hybrid_filter_scales[out_c];
+      if (bias_float) {
+        float_acc += bias_float[out_c];
+      }
+      float_acc = float_acc < act_min ? act_min : float_acc;
+      float_acc = float_acc > act_max ? act_max : float_acc;
+      output_data[b * output_depth + out_c] = float_acc;
+    }
+  }
+#else
+  // Reference C fallback
+  for (int b = 0; b < batches; ++b) {
+    for (int out_c = 0; out_c < output_depth; ++out_c) {
+      int32_t acc = 0;
+      for (int d = 0; d < accum_depth; ++d) {
+        acc += static_cast<int32_t>(input_quantized[b * accum_depth + d]) *
+               static_cast<int32_t>(filter_int8[out_c * accum_depth + d]);
+      }
+      float float_acc = acc * input_scale * data.hybrid_filter_scales[out_c];
+      if (bias_float) {
+        float_acc += bias_float[out_c];
+      }
+      float_acc = float_acc < act_min ? act_min : float_acc;
+      float_acc = float_acc > act_max ? act_max : float_acc;
+      output_data[b * output_depth + out_c] = float_acc;
+    }
+  }
+#endif  // defined(CMSIS_NN)
+  return kTfLiteOk;
+}
 
 const int kFullyConnectedInputTensor = 0;
 const int kFullyConnectedWeightsTensor = 1;

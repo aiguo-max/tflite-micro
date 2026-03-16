@@ -49,6 +49,7 @@ struct OpDataConv {
   bool is_hybrid;
   int hybrid_input_scratch_index;
   int hybrid_output_scratch_index;
+  int hybrid_im2col_scratch_index;
   const float* hybrid_filter_scales;
   int hybrid_num_channels;
   const int32_t* hybrid_row_sums;  // precomputed per-channel filter row sums
@@ -92,6 +93,16 @@ TfLiteStatus CalculateOpDataConv(TfLiteContext* context, TfLiteNode* node,
 void* ConvInit(TfLiteContext* context, const char* buffer, size_t length);
 
 TfLiteStatus ConvPrepare(TfLiteContext* context, TfLiteNode* node);
+
+// Runs hybrid (float32 input + int8 weights) convolution eval.
+// Called by both reference and CMSIS-NN kernels.
+TfLiteStatus ConvEvalHybrid(TfLiteContext* context,
+                             const TfLiteConvParams& params,
+                             const OpDataConv& data,
+                             const TfLiteEvalTensor* input,
+                             const TfLiteEvalTensor* filter,
+                             const TfLiteEvalTensor* bias,
+                             TfLiteEvalTensor* output);
 
 // This is the most generic TFLMRegistration. The actual supported types
 // may still be target dependent. The only requirement is that every

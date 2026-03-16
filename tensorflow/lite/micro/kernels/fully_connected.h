@@ -87,6 +87,15 @@ TfLiteStatus CalculateOpDataFullyConnected(
     TfLiteType data_type, const TfLiteTensor* input, const TfLiteTensor* filter,
     const TfLiteTensor* bias, TfLiteTensor* output, OpDataFullyConnected* data);
 
+TfLiteStatus FullyConnectedEvalHybrid(
+    TfLiteContext* context,
+    const TfLiteFullyConnectedParams& params,
+    const OpDataFullyConnected& data,
+    const TfLiteEvalTensor* input,
+    const TfLiteEvalTensor* filter,
+    const TfLiteEvalTensor* bias,
+    TfLiteEvalTensor* output);
+
 // This is the most generic TFLMRegistration. The actual supported types
 // may still be target dependent. The only requirement is that every
 // implementation (reference or optimized) must define this function.

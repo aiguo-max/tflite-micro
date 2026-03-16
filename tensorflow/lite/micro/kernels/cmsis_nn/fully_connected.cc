@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "tensorflow/lite/kernels/internal/reference/fully_connected.h"
 
+#include <cstring>
+
 #include "Include/arm_nnfunctions.h"
 #include "tensorflow/lite/c/builtin_op_data.h"
 #include "tensorflow/lite/c/common.h"
@@ -48,7 +50,9 @@ struct OpData {
 
 void* Init(TfLiteContext* context, const char* buffer, size_t length) {
   TFLITE_DCHECK(context->AllocatePersistentBuffer != nullptr);
-  return context->AllocatePersistentBuffer(context, sizeof(OpData));
+  void* raw = context->AllocatePersistentBuffer(context, sizeof(OpData));
+  memset(raw, 0, sizeof(OpData));
+  return raw;
 }
 
 TfLiteStatus Prepare(TfLiteContext* context, TfLiteNode* node) {
@@ -81,10 +85,14 @@ TfLiteStatus Prepare(TfLiteContext* context, TfLiteNode* node) {
   TF_LITE_ENSURE_MSG(
       context,
       (input->type == kTfLiteFloat32 && filter->type == kTfLiteFloat32) ||
+          (input->type == kTfLiteFloat32 && filter->type == kTfLiteInt8) ||
           (input->type == kTfLiteInt16 && filter->type == kTfLiteInt8) ||
           (input->type == kTfLiteInt8 &&
            (filter->type == kTfLiteInt4 || filter->type == kTfLiteInt8)),
-      "Hybrid models are not supported on TFLite Micro.");
+      "Input/filter type combination not supported on TFLite Micro.");
+
+  data->reference_op_data.is_hybrid =
+      (input->type == kTfLiteFloat32 && filter->type == kTfLiteInt8);
 
   const RuntimeShape filter_shape = GetTensorShape(filter);
   const RuntimeShape output_shape = GetTensorShape(output);
@@ -111,6 +119,34 @@ TfLiteStatus Prepare(TfLiteContext* context, TfLiteNode* node) {
   TF_LITE_ENSURE_STATUS(CalculateOpDataFullyConnected(
       context, params->activation, input->type, input, filter, bias, output,
       &(data->reference_op_data)));
+
+  if (data->reference_op_data.is_hybrid) {
+    const auto* aq =
+        static_cast<TfLiteAffineQuantization*>(filter->quantization.params);
+    TF_LITE_ENSURE(context, aq != nullptr);
+    TF_LITE_ENSURE(context, aq->scale != nullptr);
+
+    const int input_size =
+        RuntimeShape(input->dims->size,
+                     reinterpret_cast<const int32_t*>(input->dims->data))
+            .FlatSize();
+    TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
+        context, input_size * sizeof(int8_t),
+        &data->reference_op_data.hybrid_input_scratch_index));
+    data->reference_op_data.hybrid_num_channels = aq->scale->size;
+    float* scales_copy = static_cast<float*>(
+        context->AllocatePersistentBuffer(context,
+                                          aq->scale->size * sizeof(float)));
+    memcpy(scales_copy, aq->scale->data, aq->scale->size * sizeof(float));
+    data->reference_op_data.hybrid_filter_scales = scales_copy;
+    data->reference_op_data.hybrid_row_sums = nullptr;
+
+    // Allocate int32 output scratch for CMSIS-NN accelerated matmul
+    const int output_size = data->batches * data->output_depth;
+    TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
+        context, output_size * sizeof(int32_t),
+        &data->reference_op_data.hybrid_output_scratch_index));
+  }
 
   //  Currently only Int8 is supported for per channel quantization.
   TF_LITE_ENSURE(
@@ -427,6 +463,14 @@ TfLiteStatus Eval(TfLiteContext* context, TfLiteNode* node) {
   // Checks in Prepare ensure input, output and filter types are all the same.
   switch (input->type) {
     case kTfLiteFloat32: {
+      if (data.reference_op_data.is_hybrid) {
+        const auto& fc_params =
+            *(static_cast<const TfLiteFullyConnectedParams*>(
+                node->builtin_data));
+        return FullyConnectedEvalHybrid(context, fc_params,
+                                        data.reference_op_data, input, filter,
+                                        bias, output);
+      }
       const float* bias_data =
           tflite::micro::GetOptionalTensorData<float>(bias);
       tflite::reference_ops::FullyConnected(
