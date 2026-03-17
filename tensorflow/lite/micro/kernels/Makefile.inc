@@ -146,6 +146,7 @@ $(TENSORFLOW_ROOT)tensorflow/lite/micro/kernels/gather_test.cc \
 $(TENSORFLOW_ROOT)tensorflow/lite/micro/kernels/gather_nd_test.cc \
 $(TENSORFLOW_ROOT)tensorflow/lite/micro/kernels/hard_swish_test.cc \
 $(TENSORFLOW_ROOT)tensorflow/lite/micro/kernels/hybrid_model_test.cc \
+$(TENSORFLOW_ROOT)tensorflow/lite/micro/kernels/skip_s0_conv1_test.cc \
 $(TENSORFLOW_ROOT)tensorflow/lite/micro/kernels/l2norm_test.cc \
 $(TENSORFLOW_ROOT)tensorflow/lite/micro/kernels/l2_pool_2d_test.cc \
 $(TENSORFLOW_ROOT)tensorflow/lite/micro/kernels/leaky_relu_test.cc \
