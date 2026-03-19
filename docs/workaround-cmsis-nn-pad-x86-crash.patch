@@ -1,0 +1,141 @@
+# Workaround: CMSIS-NN V4.0.0 arm_pad_s8 crash on x86
+#
+# Problem
+# -------
+# CMSIS-NN V4.0.0 (commit e096196a) 新增了 arm_pad_s8()，用于加速 int8 Pad 算子。
+# 但在 x86 Linux 上编译运行时会触发 crash（SIGILL/SIGSEGV），因为该函数内部使用了
+# ARM 专有 SIMD 指令，即使加了 -DTF_LITE_DISABLE_X86_NEON 也无法规避。
+#
+# 影响范围
+# --------
+# 受影响：opensources tflite-micro 使用 OPTIMIZED_KERNEL_DIR=cmsis_nn 在 x86 Linux
+#          上编译运行（如 host-side tflm_infer 测试）。
+# 不受影响：ARM 真机（Cortex-M55 等）—— arm_pad_s8 在硬件上正常工作。
+# 不受影响：CMSIS-NN V3.6.0（如 o62-trunk-rc05）—— 该版本无 PadFunctions 目录。
+#
+# 根因
+# ----
+# tensorflow/lite/micro/kernels/cmsis_nn/pad.cc 的 int8 路径调用 arm_pad_s8()，
+# 该函数在 x86 上 crash。
+#
+# 解决方案（两步）
+# ----------------
+#
+# 第一步：删除 CMSIS-NN 的 PadFunctions 目录，消除 crash 的符号。
+#
+#   rm -rf tensorflow/lite/micro/tools/make/downloads/cmsis_nn/Source/PadFunctions
+#
+#   之后重新编译 lib：
+#   make -f tensorflow/lite/micro/tools/make/Makefile \
+#        TARGET=linux OPTIMIZED_KERNEL_DIR=cmsis_nn microlite -j12
+#
+# 第二步：应用本 patch，将 pad.cc 中的 int8 路径改为 reference C 实现（不调用 arm_pad_s8）。
+#
+#   patch -p1 < docs/workaround-cmsis-nn-pad-x86-crash.patch
+#
+# 还原方法
+# --------
+# 还原 PadFunctions 目录（从 GitHub 重新下载）：
+#
+#   COMMIT="e096196a0c49f065abc03d943c583cd50de424ba"
+#   BASE="https://raw.githubusercontent.com/ARM-software/CMSIS-NN/${COMMIT}/Source/PadFunctions"
+#   PADDIR="tensorflow/lite/micro/tools/make/downloads/cmsis_nn/Source/PadFunctions"
+#   mkdir -p "$PADDIR"
+#   wget "${BASE}/arm_pad_s8.c"   -O "${PADDIR}/arm_pad_s8.c"
+#   wget "${BASE}/CMakeLists.txt" -O "${PADDIR}/CMakeLists.txt"
+#
+# 还原 pad.cc：
+#   patch -p1 -R < docs/workaround-cmsis-nn-pad-x86-crash.patch
+#
+# 验证结果
+# --------
+# 应用本 workaround 后在 x86 上：
+#   tflm_infer MiHr_pnet_aiq_static_w8a8_float_io.tflite：正常运行，不 crash
+#   CMSIS-NN 路径 vs reference 路径：max_diff = 0.000000
+#   TFLM vs TFLite：cosine_sim = 0.999823
+
+diff --git a/tensorflow/lite/micro/kernels/cmsis_nn/pad.cc b/tensorflow/lite/micro/kernels/cmsis_nn/pad.cc
+index bacba0b3..4fc70aaf 100644
+--- a/tensorflow/lite/micro/kernels/cmsis_nn/pad.cc
++++ b/tensorflow/lite/micro/kernels/cmsis_nn/pad.cc
+@@ -15,9 +15,6 @@ limitations under the License.
+ #include "tensorflow/lite/kernels/internal/reference/pad.h"
+ 
+ #include <limits>
+-
+-#include "Include/arm_nn_types.h"
+-#include "Include/arm_nnfunctions.h"
+ #include "tensorflow/lite/c/common.h"
+ #include "tensorflow/lite/kernels/kernel_util.h"
+ #include "tensorflow/lite/micro/kernels/kernel_util.h"
+@@ -26,43 +23,6 @@ limitations under the License.
+ namespace tflite {
+ namespace {
+ 
+-TfLiteStatus PadEvalInt8(TfLiteContext* context, TfLiteNode* node) {
+-  TFLITE_DCHECK(node->user_data != nullptr);
+-  const OpData* data = static_cast<const OpData*>(node->user_data);
+-
+-  const TfLiteEvalTensor* input =
+-      tflite::micro::GetEvalInput(context, node, /*index=*/0);
+-  const TfLiteEvalTensor* constant_values =
+-      NumInputs(node) == 3
+-          ? tflite::micro::GetEvalInput(context, node, /*index=*/2)
+-          : nullptr;
+-  TfLiteEvalTensor* output =
+-      tflite::micro::GetEvalOutput(context, node, /*index=*/0);
+-
+-  int8_t pad_value;
+-  if (constant_values == nullptr) {
+-    pad_value = static_cast<uint8_t>(data->output_zero_point);
+-  } else {
+-    pad_value = *tflite::micro::GetTensorData<int8_t>(constant_values);
+-  }
+-  const int8_t* input_ptr = tflite::micro::GetTensorData<int8_t>(input);
+-  int8_t* output_ptr = tflite::micro::GetTensorData<int8_t>(output);
+-
+-  const RuntimeShape d = tflite::micro::GetTensorShape(input);
+-  const cmsis_nn_dims input_size = {d.Dims(0), d.Dims(1), d.Dims(2), d.Dims(3)};
+-
+-  const PadParams p = data->params;
+-  const cmsis_nn_dims pre_pad = {p.left_padding[0], p.left_padding[1],
+-                                 p.left_padding[2], p.left_padding[3]};
+-  const cmsis_nn_dims post_pad = {p.right_padding[0], p.right_padding[1],
+-                                  p.right_padding[2], p.right_padding[3]};
+-
+-  arm_pad_s8(input_ptr, output_ptr, pad_value, &input_size, &pre_pad,
+-             &post_pad);
+-
+-  return kTfLiteOk;
+-}
+-
+ TfLiteStatus PadEval(TfLiteContext* context, TfLiteNode* node) {
+   TFLITE_DCHECK(node->user_data != nullptr);
+   const OpData* data = static_cast<const OpData*>(node->user_data);
+@@ -96,7 +56,16 @@ TfLiteStatus PadEval(TfLiteContext* context, TfLiteNode* node) {
+       }
+     } break;
+     case kTfLiteInt8: {
+-      PadEvalInt8(context, node);
++      // Workaround: arm_pad_s8 crashes on x86 (CMSIS-NN V4.0.0).
++      // See: docs/workaround-cmsis-nn-pad-x86-crash.patch
++      int8_t pad_value =
++          constant_values == nullptr
++              ? static_cast<int8_t>(data->output_zero_point)
++              : *tflite::micro::GetTensorData<int8_t>(constant_values);
++      reference_ops::Pad(data->params, tflite::micro::GetTensorShape(input),
++                         tflite::micro::GetTensorData<int8_t>(input),
++                         &pad_value, tflite::micro::GetTensorShape(output),
++                         tflite::micro::GetTensorData<int8_t>(output));
+     } break;
+     case kTfLiteInt16: {
+       int16_t pad_value =
+@@ -138,8 +107,5 @@ TFLMRegistration Register_PADV2() {
+   return tflite::micro::RegisterOp(PadInit, PadPrepare, PadEval);
+ }
+ 
+-TFLMRegistration Register_PAD_INT8() {
+-  return tflite::micro::RegisterOp(PadInit, PadPrepare, PadEvalInt8);
+-}
+ 
+ }  // namespace tflite
