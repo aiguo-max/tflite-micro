@@ -105,64 +105,94 @@ TfLiteStatus ConvEvalHybridHifi(
       context->GetScratchBuffer(context, data.hybrid_output_scratch_index));
   static int8_t s_zero_bias[512] = {};
 
+  float combined_scales[512];
+  for (int c = 0; c < output_depth; ++c) {
+    combined_scales[c] = input_scale * data.hybrid_filter_scales[c];
+  }
+
   for (int batch = 0; batch < batches; ++batch) {
     const int8_t* batch_input = input_quantized + batch * input_height * input_width * input_depth;
-    
-    // Process each output position
+
     for (int out_y = 0; out_y < output_height; ++out_y) {
       for (int out_x = 0; out_x < output_width; ++out_x) {
-        // Im2col: extract patch for this output position
-        int8_t* patch = im2col_buffer;
-        
-        for (int filter_y = 0; filter_y < filter_height; ++filter_y) {
-          for (int filter_x = 0; filter_x < filter_width; ++filter_x) {
-            const int in_y = out_y * stride_height - pad_height + 
-                           filter_y * dilation_height_factor;
-            const int in_x = out_x * stride_width - pad_width + 
-                           filter_x * dilation_width_factor;
-            
-            if (in_y >= 0 && in_y < input_height && in_x >= 0 && in_x < input_width) {
-              const int8_t* input_ptr = batch_input + 
-                                      (in_y * input_width + in_x) * input_depth;
-              memcpy(patch, input_ptr, input_depth * sizeof(int8_t));
-            } else {
-              // Padding with zeros
-              memset(patch, 0, input_depth * sizeof(int8_t));
+        int8_t* patch = im2col_buffer + out_x * patch_size;
+
+        for (int fy = 0; fy < filter_height; ++fy) {
+          const int in_y = out_y * stride_height - pad_height +
+                           fy * dilation_height_factor;
+          if (in_y >= 0 && in_y < input_height) {
+            for (int fx = 0; fx < filter_width; ++fx) {
+              const int in_x = out_x * stride_width - pad_width +
+                               fx * dilation_width_factor;
+              if (in_x >= 0 && in_x < input_width) {
+                memcpy(patch + (fy * filter_width + fx) * input_depth,
+                       batch_input + (in_y * input_width + in_x) * input_depth,
+                       input_depth * sizeof(int8_t));
+              } else {
+                memset(patch + (fy * filter_width + fx) * input_depth,
+                       0, input_depth * sizeof(int8_t));
+              }
             }
-            patch += input_depth;
+          } else {
+            memset(patch + fy * filter_width * input_depth,
+                   0, filter_width * input_depth * sizeof(int8_t));
           }
         }
-        
-        xa_nn_matXvec_8x8_32(
-            acc_buf,
-            const_cast<int8_t*>(filter_int8),
-            nullptr,
-            im2col_buffer,
-            nullptr,
-            s_zero_bias,
-            output_depth,
-            patch_size,
-            0,
-            patch_size,
-            0,
-            0,
-            0);
+      }
 
-        for (int out_c = 0; out_c < output_depth; ++out_c) {
-          float float_acc = static_cast<float>(acc_buf[out_c]) *
-                            input_scale * data.hybrid_filter_scales[out_c];
-          if (bias_float) {
-            float_acc += bias_float[out_c];
-          }
-          
-          // Activation clamp
-          float_acc = float_acc < act_min ? act_min : float_acc;
-          float_acc = float_acc > act_max ? act_max : float_acc;
-          
-          const int output_idx = batch * output_height * output_width * output_depth +
-                               out_y * output_width * output_depth +
-                               out_x * output_depth + out_c;
-          output_data[output_idx] = float_acc;
+      int8_t* vec_ptrs[256];
+      int32_t* out_ptrs[256];
+      for (int x = 0; x < output_width; ++x) {
+        vec_ptrs[x] = im2col_buffer + x * patch_size;
+        out_ptrs[x] = acc_buf + x * output_depth;
+      }
+
+      int vec_done = 0;
+      while (vec_done < output_width) {
+        int batch_count = output_width - vec_done;
+        if (batch_count >= 2 && (batch_count & 1)) batch_count--;
+        if (batch_count >= 2) {
+          xa_nn_matXvec_batch_8x8_32(
+              out_ptrs + vec_done,
+              const_cast<int8_t*>(filter_int8),
+              vec_ptrs + vec_done,
+              s_zero_bias,
+              output_depth,
+              patch_size,
+              patch_size,
+              0,
+              0,
+              batch_count);
+          vec_done += batch_count;
+        } else {
+          xa_nn_matXvec_8x8_32(
+              out_ptrs[vec_done],
+              const_cast<int8_t*>(filter_int8),
+              nullptr,
+              vec_ptrs[vec_done],
+              nullptr,
+              s_zero_bias,
+              output_depth,
+              patch_size,
+              0,
+              patch_size,
+              0,
+              0,
+              0);
+          vec_done++;
+        }
+      }
+
+      float* row_out = output_data +
+          (batch * output_height + out_y) * output_width * output_depth;
+      for (int x = 0; x < output_width; ++x) {
+        const int32_t* acc = acc_buf + x * output_depth;
+        float* out_ptr = row_out + x * output_depth;
+        for (int c = 0; c < output_depth; ++c) {
+          float v = static_cast<float>(acc[c]) * combined_scales[c];
+          if (bias_float) v += bias_float[c];
+          v = v < act_min ? act_min : (v > act_max ? act_max : v);
+          out_ptr[c] = v;
         }
       }
     }
