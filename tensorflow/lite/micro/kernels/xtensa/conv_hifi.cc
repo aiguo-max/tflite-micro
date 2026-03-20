@@ -91,29 +91,25 @@ TfLiteStatus ConvPrepareHifi(TfLiteContext* context, TfLiteNode* node) {
   const int pad_width = data->reference_op_data.padding.width;
 
   int required_scratch = 0;
+  TfLiteType input_type = input->type;
   // TODO(b/277112516): Dilation is currently not supported on HiFi 4 NN Library
   if ((params->dilation_width_factor == 1) &&
       (params->dilation_height_factor == 1)) {
-    if (input->type == kTfLiteInt8) {
+    if (input_type == kTfLiteInt8) {
       required_scratch = xa_nn_conv2d_std_getsize(
           input_height, input_width, input_depth, filter_height, filter_width,
           filter_depth, stride_height, pad_height, stride_width, pad_width,
           output_height, output_width, output_channels, PREC_ASYM8S, PREC_SYM8S,
           1, 1, 0);
-      TF_LITE_ENSURE(context, required_scratch > 0);
     }
-    if (input->type == kTfLiteInt16) {
+    if (input_type == kTfLiteInt16) {
       required_scratch = xa_nn_conv2d_std_getsize(
           input_height, input_width, input_depth, filter_height, filter_width,
           filter_depth, stride_height, pad_height, stride_width, pad_width,
           output_height, output_width, output_channels, PREC_SYM16S, PREC_SYM8S,
           1, 1, 0);
-      TF_LITE_ENSURE(context, required_scratch > 0);
     }
   }
-  TF_LITE_ENSURE_OK(
-      context, context->RequestScratchBufferInArena(
-                   context, required_scratch, &data->scratch_tensor_index));
 
   micro_context->DeallocateTempTfLiteTensor(input);
   micro_context->DeallocateTempTfLiteTensor(filter);
@@ -121,6 +117,16 @@ TfLiteStatus ConvPrepareHifi(TfLiteContext* context, TfLiteNode* node) {
   if (bias != nullptr) {
     micro_context->DeallocateTempTfLiteTensor(bias);
   }
+
+  if ((input_type == kTfLiteInt8 || input_type == kTfLiteInt16) &&
+      (params->dilation_width_factor == 1) &&
+      (params->dilation_height_factor == 1)) {
+    TF_LITE_ENSURE(context, required_scratch > 0);
+  }
+
+  TF_LITE_ENSURE_OK(
+      context, context->RequestScratchBufferInArena(
+                   context, required_scratch, &data->scratch_tensor_index));
   return kTfLiteOk;
 }
 

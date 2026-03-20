@@ -29,6 +29,17 @@ limitations under the License.
 
 namespace tflite {
 
+#if defined(HIFI4) || defined(HIFI5) || defined(XTENSA)
+TfLiteStatus FullyConnectedEvalHybridHifi(
+    TfLiteContext* context,
+    const TfLiteFullyConnectedParams& params,
+    const OpDataFullyConnected& data,
+    const TfLiteEvalTensor* input,
+    const TfLiteEvalTensor* filter,
+    const TfLiteEvalTensor* bias,
+    TfLiteEvalTensor* output);
+#endif  // defined(HIFI4) || defined(HIFI5) || defined(XTENSA)
+
 namespace {
 
 TfLiteStatus Eval(TfLiteContext* context, TfLiteNode* node) {
@@ -65,6 +76,13 @@ TfLiteStatus Eval(TfLiteContext* context, TfLiteNode* node) {
   // Checks in Prepare ensure input, output and filter types are all the same.
   switch (input->type) {
     case kTfLiteFloat32: {
+      if (data.is_hybrid) {
+#if defined(HIFI4) || defined(HIFI5) || defined(XTENSA)
+        return FullyConnectedEvalHybridHifi(context, *params, data, input, filter, bias, output);
+#else
+        return FullyConnectedEvalHybrid(context, *params, data, input, filter, bias, output);
+#endif
+      }
       tflite::reference_ops::FullyConnected(
           FullyConnectedParamsFloat(params->activation),
           tflite::micro::GetTensorShape(input),

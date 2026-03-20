@@ -52,6 +52,15 @@ TfLiteStatus Eval(TfLiteContext* context, TfLiteNode* node) {
 
   switch (input->type) {
     case kTfLiteFloat32: {
+      if (op_data.reference_op_data.is_hybrid) {
+#if defined(HIFI4) || defined(HIFI5) || defined(XTENSA)
+        return ConvEvalHybridHifi(context, params, op_data.reference_op_data,
+                                  input, filter, bias, output);
+#else
+        return ConvEvalHybrid(context, params, op_data.reference_op_data,
+                              input, filter, bias, output);
+#endif
+      }
 #ifdef USE_TFLM_COMPRESSION
 
       MicroContext* micro_context = GetMicroContext(context);

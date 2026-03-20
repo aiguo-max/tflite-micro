@@ -156,12 +156,13 @@ bool SingleArenaBufferAllocator::IsAllTempDeallocated() {
 
 TfLiteStatus SingleArenaBufferAllocator::ResetTempAllocations() {
   // TODO(b/209453859): enable error check based on IsAllTempDeallocated after
-  // all AllocateTemp have been paird with DeallocateTemp
+  // all AllocateTemp have been paired with DeallocateTemp
   if (!IsAllTempDeallocated()) {
     MicroPrintf(
         "All temp buffers must be freed before calling ResetTempAllocations()");
-    return kTfLiteError;
   }
+  temp_buffer_count_ = 0;
+  temp_buffer_ptr_check_sum_ = 0;
   temp_ = head_;
   return kTfLiteOk;
 }

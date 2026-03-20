@@ -22,17 +22,22 @@ limitations under the License.
 #include "tensorflow/lite/micro/kernels/xtensa/xtensa.h"
 #include "tensorflow/lite/micro/kernels/xtensa/xtensa_fully_connected.h"
 
+#include <cstring>
+
 namespace tflite {
 
 void* XtensaInitFullyConnected(TfLiteContext* context, const char* buffer,
                                size_t length) {
   TFLITE_DCHECK(context->AllocatePersistentBuffer != nullptr);
 #if !defined(VISION_P6)
-  return context->AllocatePersistentBuffer(context,
-                                           sizeof(OpDataFullyConnected));
+  void* raw = context->AllocatePersistentBuffer(context,
+                                                sizeof(OpDataFullyConnected));
+  memset(raw, 0, sizeof(OpDataFullyConnected));
+  return raw;
 #else
   void* data = context->AllocatePersistentBuffer(
       context, sizeof(XtensaFullyConnectedOpData));
+  memset(data, 0, sizeof(XtensaFullyConnectedOpData));
 #if !defined(HIFIMINI)
   if (InitXtensaContext()) {
     return nullptr;
@@ -105,6 +110,8 @@ TfLiteStatus XtensaPrepareFullyConnected(TfLiteContext* context,
   TF_LITE_ENSURE(context, output != nullptr);
   TF_LITE_ENSURE_TYPES_EQ(context, input->type, output->type);
 
+  data->is_hybrid = (input->type == kTfLiteFloat32 && filter->type == kTfLiteInt8);
+
   if (filter->type == kTfLiteInt4) {
     int filter_size =
         RuntimeShape(filter->dims->size,
@@ -112,6 +119,30 @@ TfLiteStatus XtensaPrepareFullyConnected(TfLiteContext* context,
             .FlatSize();
     context->RequestScratchBufferInArena(context, filter_size,
                                          &data->filter_buffer_index);
+  }
+
+  // Stash hybrid scratch sizes before deallocating temp tensors.
+  // RequestScratchBufferInArena requires temp allocations to be clean
+  // (head_temp_ == next_temp_), so scratch requests must happen after
+  // DeallocateTempTfLiteTensor calls below.
+  int hybrid_input_size = 0;
+  int hybrid_output_size = 0;
+  int hybrid_num_channels = 0;
+  float* hybrid_filter_scales = nullptr;
+  if (data->is_hybrid) {
+    const auto* aq = static_cast<TfLiteAffineQuantization*>(filter->quantization.params);
+    TF_LITE_ENSURE(context, aq != nullptr);
+    TF_LITE_ENSURE(context, aq->scale != nullptr);
+    hybrid_num_channels = aq->scale->size;
+    hybrid_input_size = RuntimeShape(input->dims->size,
+                                     reinterpret_cast<const int32_t*>(input->dims->data))
+                            .FlatSize();
+    hybrid_output_size = RuntimeShape(output->dims->size,
+                                      reinterpret_cast<const int32_t*>(output->dims->data))
+                             .FlatSize();
+    hybrid_filter_scales = static_cast<float*>(
+        context->AllocatePersistentBuffer(context, aq->scale->size * sizeof(float)));
+    memcpy(hybrid_filter_scales, aq->scale->data, aq->scale->size * sizeof(float));
   }
 
   TFLITE_DCHECK_GE(GetTensorShape(output).DimensionsCount(), 1);
@@ -143,6 +174,19 @@ TfLiteStatus XtensaPrepareFullyConnected(TfLiteContext* context,
     micro_context->DeallocateTempTfLiteTensor(bias);
   }
   micro_context->DeallocateTempTfLiteTensor(output);
+
+  if (data->is_hybrid) {
+    TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
+        context, hybrid_input_size * sizeof(int8_t),
+        &data->hybrid_input_scratch_index));
+    TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
+        context, hybrid_output_size * sizeof(int32_t),
+        &data->hybrid_output_scratch_index));
+    data->hybrid_num_channels = hybrid_num_channels;
+    data->hybrid_filter_scales = hybrid_filter_scales;
+    data->hybrid_row_sums = nullptr;
+  }
+
 #if defined(VISION_P6)
   TF_LITE_ENSURE_OK(context, FullyConnectedPrepareVision(context, node));
 #endif  // defined(VISION_P6)
