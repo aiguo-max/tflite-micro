@@ -107,7 +107,7 @@ TfLiteStatus ConvEvalHybridHifi(
 
   int32_t* acc_buf = static_cast<int32_t*>(
       context->GetScratchBuffer(context, data.hybrid_output_scratch_index));
-  static int8_t s_zero_bias[512] = {};
+  int8_t s_zero_bias[512] = {};
 
   float combined_scales[512];
   const bool is_per_channel = (data.hybrid_num_channels == output_depth);

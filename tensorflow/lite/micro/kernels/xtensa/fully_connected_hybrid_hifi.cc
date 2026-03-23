@@ -86,7 +86,7 @@ TfLiteStatus FullyConnectedEvalHybridHifi(
   int32_t* acc_buf = static_cast<int32_t*>(
       context->GetScratchBuffer(context, data.hybrid_output_scratch_index));
 
-  static int8_t s_zero_bias[512] = {};
+  int8_t s_zero_bias[512] = {};
 
   for (int b = 0; b < batches; ++b) {
     const int8_t* batch_input = input_quantized + b * accum_depth;
