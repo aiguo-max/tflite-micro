@@ -48,46 +48,12 @@ TfLiteStatus ConvPrepareXtensa(TfLiteContext* context, TfLiteNode* node) {
 
   const TfLiteTensor* input = GetInput(context, node, kConvInputTensor);
   const TfLiteTensor* filter = GetInput(context, node, kConvWeightsTensor);
-  const TfLiteTensor* output = GetOutput(context, node, kConvOutputTensor);
 
   // Check for hybrid mode (float32 input + int8 filter)
   data->reference_op_data.is_hybrid =
       (input->type == kTfLiteFloat32 && filter->type == kTfLiteInt8);
 
   TF_LITE_ENSURE_OK(context, ConvPrepare(context, node));
-
-  // Allocate hybrid scratch buffers if needed
-  if (data->reference_op_data.is_hybrid) {
-    int input_size = RuntimeShape(input->dims->size,
-                                  reinterpret_cast<const int32_t*>(input->dims->data))
-                         .FlatSize();
-    context->RequestScratchBufferInArena(
-        context, input_size * sizeof(int8_t),
-        &data->reference_op_data.hybrid_input_scratch_index);
-
-    const auto* aq =
-        static_cast<TfLiteAffineQuantization*>(filter->quantization.params);
-    data->reference_op_data.hybrid_num_channels = aq->scale->size;
-    float* scales_copy = static_cast<float*>(context->AllocatePersistentBuffer(
-        context, aq->scale->size * sizeof(float)));
-    memcpy(scales_copy, aq->scale->data, aq->scale->size * sizeof(float));
-    data->reference_op_data.hybrid_filter_scales = scales_copy;
-    data->reference_op_data.hybrid_row_sums = nullptr;
-
-    const int filter_h = filter->dims->data[1];
-    const int filter_w = filter->dims->data[2];
-    const int input_depth = input->dims->data[3];
-    const int output_w = output->dims->data[2];
-    const int patch_size = filter_h * filter_w * input_depth;
-    TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
-        context, output_w * patch_size * sizeof(int8_t),
-        &data->reference_op_data.hybrid_im2col_scratch_index));
-
-    const int output_depth = filter->dims->data[0];
-    TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
-        context, output_w * output_depth * sizeof(int32_t),
-        &data->reference_op_data.hybrid_output_scratch_index));
-  }
 
 #if defined(HIFI3) || defined(HIFI4) || defined(HIFI5)
   TF_LITE_ENSURE_OK(context, ConvPrepareHifi(context, node));

@@ -101,13 +101,20 @@ TfLiteStatus ConvEvalHybridHifi(
 
   const int patch_size = filter_height * filter_width * input_depth;
 
+  if ((patch_size & 3) != 0) {
+    return ConvEvalHybrid(context, params, data, input, filter, bias, output);
+  }
+
   int32_t* acc_buf = static_cast<int32_t*>(
       context->GetScratchBuffer(context, data.hybrid_output_scratch_index));
   static int8_t s_zero_bias[512] = {};
 
   float combined_scales[512];
+  const bool is_per_channel = (data.hybrid_num_channels == output_depth);
   for (int c = 0; c < output_depth; ++c) {
-    combined_scales[c] = input_scale * data.hybrid_filter_scales[c];
+    const float filter_scale = is_per_channel ? data.hybrid_filter_scales[c]
+                                              : data.hybrid_filter_scales[0];
+    combined_scales[c] = input_scale * filter_scale;
   }
 
   for (int batch = 0; batch < batches; ++batch) {

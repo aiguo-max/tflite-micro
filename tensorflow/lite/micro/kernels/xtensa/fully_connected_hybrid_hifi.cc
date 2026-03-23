@@ -106,9 +106,12 @@ TfLiteStatus FullyConnectedEvalHybridHifi(
         0,
         0);
 
+    const bool is_per_channel = (data.hybrid_num_channels == output_depth);
     for (int out_c = 0; out_c < output_depth; ++out_c) {
+      const float filter_scale = is_per_channel ? data.hybrid_filter_scales[out_c]
+                                                : data.hybrid_filter_scales[0];
       float float_acc = static_cast<float>(acc_buf[out_c]) *
-                        input_scale * data.hybrid_filter_scales[out_c];
+                        input_scale * filter_scale;
       if (bias_float) {
         float_acc += bias_float[out_c];
       }
