@@ -103,20 +103,9 @@ TfLiteStatus FullyConnectedPrepare(TfLiteContext* context, TfLiteNode* node) {
     memcpy(scales_copy, aq->scale->data, aq->scale->size * sizeof(float));
     data->hybrid_filter_scales = scales_copy;
 
-    const int output_depth = filter->dims->data[0];
-    const int accum_depth = filter->dims->data[1];
-    int32_t* row_sums = static_cast<int32_t*>(context->AllocatePersistentBuffer(
-        context, output_depth * sizeof(int32_t)));
-    const int8_t* filter_data = GetTensorData<int8_t>(filter);
-    for (int oc = 0; oc < output_depth; ++oc) {
-      int32_t sum = 0;
-      const int8_t* row = filter_data + oc * accum_depth;
-      for (int i = 0; i < accum_depth; ++i) {
-        sum += row[i];
-      }
-      row_sums[oc] = sum;
-    }
-    data->hybrid_row_sums = row_sums;
+    // hybrid_row_sums is not used in any current Eval path (symmetric
+    // zero-point=0 quantization does not require filter row sums).
+    data->hybrid_row_sums = nullptr;
 
     // Allocate int32 output scratch for CMSIS-NN accelerated matmul
     const int output_size =

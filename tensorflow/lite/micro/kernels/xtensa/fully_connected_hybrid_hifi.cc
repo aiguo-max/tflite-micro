@@ -83,6 +83,8 @@ TfLiteStatus FullyConnectedEvalHybridHifi(
   const float act_min = op_params.float_activation_min;
   const float act_max = op_params.float_activation_max;
 
+  TF_LITE_ENSURE(context, output_depth <= 512);
+
   int32_t* acc_buf = static_cast<int32_t*>(
       context->GetScratchBuffer(context, data.hybrid_output_scratch_index));
 

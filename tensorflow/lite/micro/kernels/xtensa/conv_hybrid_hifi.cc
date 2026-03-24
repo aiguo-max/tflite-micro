@@ -105,6 +105,9 @@ TfLiteStatus ConvEvalHybridHifi(
     return ConvEvalHybrid(context, params, data, input, filter, bias, output);
   }
 
+  TF_LITE_ENSURE(context, output_depth <= 512);
+  TF_LITE_ENSURE(context, output_width <= 256);
+
   int32_t* acc_buf = static_cast<int32_t*>(
       context->GetScratchBuffer(context, data.hybrid_output_scratch_index));
   int8_t s_zero_bias[512] = {};
