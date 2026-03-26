@@ -67,6 +67,8 @@ struct OpDataConv {
 #endif  // USE_TFLM_COMPRESSION
 };
 
+static constexpr int kHybridConvTileWidth = 8;
+
 extern const int kConvInputTensor;
 extern const int kConvWeightsTensor;
 extern const int kConvBiasTensor;

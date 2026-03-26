@@ -98,55 +98,68 @@ TfLiteStatus ConvEvalHybrid(TfLiteContext* context,
   const float act_max = op_params.float_activation_max;
 
 #if defined(CMSIS_NN)
-  // CMSIS-NN accelerated path: im2col + matmul per output row
   const int patch_size = filter_height * filter_width * input_depth;
   int8_t* im2col = static_cast<int8_t*>(
       context->GetScratchBuffer(context, data.hybrid_im2col_scratch_index));
-  int32_t* int32_output = static_cast<int32_t*>(
-      context->GetScratchBuffer(context, data.hybrid_output_scratch_index));
+
+  // Reuse output_data (float32) as int32 workspace — same element size.
+  // Process output row by tiled chunks of kHybridConvTileWidth columns.
+  const int tile_w = kHybridConvTileWidth;
 
   for (int batch = 0; batch < batches; ++batch) {
     for (int out_y = 0; out_y < output_height; ++out_y) {
-      // Fill im2col for this output row
-      for (int out_x = 0; out_x < output_width; ++out_x) {
-        const int in_x_origin = (out_x * stride_width) - pad_width;
-        const int in_y_origin = (out_y * stride_height) - pad_height;
-        for (int fy = 0; fy < filter_height; ++fy) {
-          for (int fx = 0; fx < filter_width; ++fx) {
-            const int in_y = in_y_origin + dilation_height_factor * fy;
-            const int in_x = in_x_origin + dilation_width_factor * fx;
-            int8_t* dst = im2col + out_x * patch_size +
-                          (fy * filter_width + fx) * input_depth;
-            if (in_y >= 0 && in_y < input_height &&
-                in_x >= 0 && in_x < input_width) {
-              memcpy(dst,
-                     input_quantized + Offset(input_shape, batch, in_y, in_x, 0),
-                     input_depth);
-            } else {
-              memset(dst, 0, input_depth);
+      for (int tile_start = 0; tile_start < output_width;
+           tile_start += tile_w) {
+        const int cur_tile =
+            (tile_start + tile_w <= output_width) ? tile_w
+                                                  : (output_width - tile_start);
+
+        for (int t = 0; t < cur_tile; ++t) {
+          const int out_x = tile_start + t;
+          const int in_x_origin = (out_x * stride_width) - pad_width;
+          const int in_y_origin = (out_y * stride_height) - pad_height;
+          for (int fy = 0; fy < filter_height; ++fy) {
+            for (int fx = 0; fx < filter_width; ++fx) {
+              const int in_y = in_y_origin + dilation_height_factor * fy;
+              const int in_x = in_x_origin + dilation_width_factor * fx;
+              int8_t* dst = im2col + t * patch_size +
+                            (fy * filter_width + fx) * input_depth;
+              if (in_y >= 0 && in_y < input_height &&
+                  in_x >= 0 && in_x < input_width) {
+                memcpy(dst,
+                       input_quantized +
+                           Offset(input_shape, batch, in_y, in_x, 0),
+                       input_depth);
+              } else {
+                memset(dst, 0, input_depth);
+              }
             }
           }
         }
-      }
 
-      // Matmul: [output_w × patch_size] × [output_depth × patch_size]^T
-      memset(int32_output, 0, output_width * output_depth * sizeof(int32_t));
-      arm_nn_mat_mult_nt_t_s8_s32(
-          im2col, filter_int8, int32_output,
-          output_width, patch_size, output_depth, 0, 1);
+        // Reuse the output float buffer as int32 accumulator for this tile.
+        // sizeof(float) == sizeof(int32_t) == 4, so the space is sufficient.
+        int32_t* tile_acc = reinterpret_cast<int32_t*>(
+            output_data +
+            Offset(output_shape, batch, out_y, tile_start, 0));
+        memset(tile_acc, 0, cur_tile * output_depth * sizeof(int32_t));
 
-      // Dequantize int32 → float32
-      for (int out_x = 0; out_x < output_width; ++out_x) {
-        for (int out_c = 0; out_c < output_depth; ++out_c) {
-          float float_acc = int32_output[out_x * output_depth + out_c] *
-                            input_scale * data.hybrid_filter_scales[out_c];
+        arm_nn_mat_mult_nt_t_s8_s32(im2col, filter_int8, tile_acc, cur_tile,
+                                     patch_size, output_depth, 0, 1);
+
+        // Convert int32 accumulator to float32 in-place (backwards to avoid
+        // overwriting unread int32 values when sizeof matches).
+        for (int idx = cur_tile * output_depth - 1; idx >= 0; --idx) {
+          const int out_c = idx % output_depth;
+          float float_acc =
+              tile_acc[idx] * input_scale * data.hybrid_filter_scales[out_c];
           if (bias_float) {
             float_acc += bias_float[out_c];
           }
           float_acc = float_acc < act_min ? act_min : float_acc;
           float_acc = float_acc > act_max ? act_max : float_acc;
-          output_data[Offset(output_shape, batch, out_y, out_x, out_c)] =
-              float_acc;
+          output_data[Offset(output_shape, batch, out_y, tile_start, 0) +
+                      idx] = float_acc;
         }
       }
     }
@@ -407,21 +420,18 @@ TfLiteStatus ConvPrepare(TfLiteContext* context, TfLiteNode* node) {
     data->hybrid_filter_scales = scales_copy;
     data->hybrid_row_sums = nullptr;
 
-    // Allocate im2col scratch: one output row of patches
     const int filter_h = filter->dims->data[1];
     const int filter_w = filter->dims->data[2];
     const int input_depth = input->dims->data[3];
-    const int output_w = output->dims->data[2];
     const int patch_size = filter_h * filter_w * input_depth;
+    const int tile_w = kHybridConvTileWidth;
     TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
-        context, output_w * patch_size * sizeof(int8_t),
+        context, tile_w * patch_size * sizeof(int8_t),
         &data->hybrid_im2col_scratch_index));
 
-    // Allocate int32 output scratch: one output row
-    const int output_depth = filter->dims->data[0];
-    TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
-        context, output_w * output_depth * sizeof(int32_t),
-        &data->hybrid_output_scratch_index));
+    // int32 output scratch eliminated: ConvEvalHybrid reuses the float32
+    // output tensor buffer as int32 accumulator (same element size).
+    data->hybrid_output_scratch_index = -1;
   }
 
 #ifdef USE_TFLM_COMPRESSION

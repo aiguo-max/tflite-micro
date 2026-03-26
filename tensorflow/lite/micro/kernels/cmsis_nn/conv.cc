@@ -163,16 +163,13 @@ TfLiteStatus Prepare(TfLiteContext* context, TfLiteNode* node) {
     data->reference_op_data.hybrid_filter_scales = scales_copy;
     data->reference_op_data.hybrid_row_sums = nullptr;
 
-    // Allocate im2col scratch: one output row of patches
     const int patch_size = filter_dims.h * filter_dims.w * input_dims.c;
+    const int tile_w = kHybridConvTileWidth;
     TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
-        context, output_dims.w * patch_size * sizeof(int8_t),
+        context, tile_w * patch_size * sizeof(int8_t),
         &data->reference_op_data.hybrid_im2col_scratch_index));
 
-    // Allocate int32 output scratch: one output row
-    TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
-        context, output_dims.w * output_dims.c * sizeof(int32_t),
-        &data->reference_op_data.hybrid_output_scratch_index));
+    data->reference_op_data.hybrid_output_scratch_index = -1;
   }
 
   // CMSIS_NN allows INT64 or nullptr bias data pointer
