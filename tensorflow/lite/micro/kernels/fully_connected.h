@@ -45,6 +45,7 @@ struct OpDataFullyConnected {
   bool is_hybrid;
   int hybrid_input_scratch_index;
   int hybrid_output_scratch_index;
+  int hybrid_scales_scratch_index;
   const float* hybrid_filter_scales;
   int hybrid_num_channels;
   const int32_t* hybrid_row_sums;
@@ -87,14 +88,13 @@ TfLiteStatus CalculateOpDataFullyConnected(
     TfLiteType data_type, const TfLiteTensor* input, const TfLiteTensor* filter,
     const TfLiteTensor* bias, TfLiteTensor* output, OpDataFullyConnected* data);
 
-TfLiteStatus FullyConnectedEvalHybrid(
-    TfLiteContext* context,
-    const TfLiteFullyConnectedParams& params,
-    const OpDataFullyConnected& data,
-    const TfLiteEvalTensor* input,
-    const TfLiteEvalTensor* filter,
-    const TfLiteEvalTensor* bias,
-    TfLiteEvalTensor* output);
+TfLiteStatus FullyConnectedEvalHybrid(TfLiteContext* context,
+                                      const TfLiteFullyConnectedParams& params,
+                                      const OpDataFullyConnected& data,
+                                      const TfLiteEvalTensor* input,
+                                      const TfLiteEvalTensor* filter,
+                                      const TfLiteEvalTensor* bias,
+                                      TfLiteEvalTensor* output);
 
 // This is the most generic TFLMRegistration. The actual supported types
 // may still be target dependent. The only requirement is that every

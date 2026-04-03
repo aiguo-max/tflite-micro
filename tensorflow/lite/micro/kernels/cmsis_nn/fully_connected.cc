@@ -134,14 +134,18 @@ TfLiteStatus Prepare(TfLiteContext* context, TfLiteNode* node) {
         context, input_size * sizeof(int8_t),
         &data->reference_op_data.hybrid_input_scratch_index));
     data->reference_op_data.hybrid_num_channels = aq->scale->size;
-    float* scales_copy = static_cast<float*>(
-        context->AllocatePersistentBuffer(context,
-                                          aq->scale->size * sizeof(float)));
+    float* scales_copy = static_cast<float*>(context->AllocatePersistentBuffer(
+        context, aq->scale->size * sizeof(float)));
     memcpy(scales_copy, aq->scale->data, aq->scale->size * sizeof(float));
     data->reference_op_data.hybrid_filter_scales = scales_copy;
     data->reference_op_data.hybrid_row_sums = nullptr;
 
-    // Allocate int32 output scratch for CMSIS-NN accelerated matmul
+    const int accum_depth = filter->dims->data[1];
+    const int batches = input_size / accum_depth;
+    TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
+        context, batches * sizeof(float),
+        &data->reference_op_data.hybrid_scales_scratch_index));
+
     const int output_size = data->batches * data->output_depth;
     TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
         context, output_size * sizeof(int32_t),
@@ -464,9 +468,8 @@ TfLiteStatus Eval(TfLiteContext* context, TfLiteNode* node) {
   switch (input->type) {
     case kTfLiteFloat32: {
       if (data.reference_op_data.is_hybrid) {
-        const auto& fc_params =
-            *(static_cast<const TfLiteFullyConnectedParams*>(
-                node->builtin_data));
+        const auto& fc_params = *(
+            static_cast<const TfLiteFullyConnectedParams*>(node->builtin_data));
         return FullyConnectedEvalHybrid(context, fc_params,
                                         data.reference_op_data, input, filter,
                                         bias, output);

@@ -81,6 +81,30 @@ TfLiteStatus SlicePrepare(TfLiteContext* context, TfLiteNode* node) {
   return kTfLiteOk;
 }
 
+// Update output tensor dims based on runtime size values. This is necessary
+// for correct behavior inside WHILE loops where slice sizes are dynamic
+// (e.g., TensorArray emulation via SLICE+CONCAT). Without this, downstream
+// ops like CONCATENATION see stale static shapes and produce incorrect results
+// or crash on shape validation.
+template <typename T>
+void UpdateOutputDims(const TfLiteEvalTensor* input,
+                      const TfLiteEvalTensor* begin_tensor,
+                      const TfLiteEvalTensor* size_tensor,
+                      TfLiteEvalTensor* output) {
+  const int dims = input->dims->size;
+  for (int i = 0; i < dims; ++i) {
+    int32_t size_val =
+        static_cast<int32_t>(tflite::micro::GetTensorData<T>(size_tensor)[i]);
+    if (size_val == -1) {
+      // -1 means "all remaining elements along this dimension"
+      int32_t begin_val = static_cast<int32_t>(
+          tflite::micro::GetTensorData<T>(begin_tensor)[i]);
+      size_val = input->dims->data[i] - begin_val;
+    }
+    output->dims->data[i] = size_val;
+  }
+}
+
 TfLiteStatus SliceEval(TfLiteContext* context, TfLiteNode* node) {
   const TfLiteEvalTensor* input =
       tflite::micro::GetEvalInput(context, node, kInputTensor);
@@ -102,9 +126,11 @@ TfLiteStatus SliceEval(TfLiteContext* context, TfLiteNode* node) {
   if (begin->type == kTfLiteInt32) {
     GetBeginAndSizeVectors<int32_t>(input->dims->size, begin, size,
                                     op_params.begin, op_params.size);
+    UpdateOutputDims<int32_t>(input, begin, size, output);
   } else if (begin->type == kTfLiteInt64) {
     GetBeginAndSizeVectors<int64_t>(input->dims->size, begin, size,
                                     op_params.begin, op_params.size);
+    UpdateOutputDims<int64_t>(input, begin, size, output);
   } else {
     MicroPrintf("Begin tensor type %s (%d) not supported.",
                 TfLiteTypeGetName(input->type), input->type);

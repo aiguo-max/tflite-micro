@@ -34,14 +34,13 @@ limitations under the License.
 
 namespace tflite {
 
-TfLiteStatus FullyConnectedEvalHybrid(
-    TfLiteContext* context,
-    const TfLiteFullyConnectedParams& params,
-    const OpDataFullyConnected& data,
-    const TfLiteEvalTensor* input,
-    const TfLiteEvalTensor* filter,
-    const TfLiteEvalTensor* bias,
-    TfLiteEvalTensor* output) {
+TfLiteStatus FullyConnectedEvalHybrid(TfLiteContext* context,
+                                      const TfLiteFullyConnectedParams& params,
+                                      const OpDataFullyConnected& data,
+                                      const TfLiteEvalTensor* input,
+                                      const TfLiteEvalTensor* filter,
+                                      const TfLiteEvalTensor* bias,
+                                      TfLiteEvalTensor* output) {
   const int8_t* filter_int8 = tflite::micro::GetTensorData<int8_t>(filter);
   const float* input_data = tflite::micro::GetTensorData<float>(input);
   const float* bias_float = tflite::micro::GetOptionalTensorData<float>(bias);
@@ -54,57 +53,65 @@ TfLiteStatus FullyConnectedEvalHybrid(
   int8_t* input_quantized = static_cast<int8_t*>(
       context->GetScratchBuffer(context, data.hybrid_input_scratch_index));
 
-  float min_val = input_data[0];
-  float max_val = input_data[0];
-  for (int i = 1; i < input_size; ++i) {
-    if (input_data[i] < min_val) min_val = input_data[i];
-    if (input_data[i] > max_val) max_val = input_data[i];
-  }
-
-  const float range = std::max(std::abs(min_val), std::abs(max_val));
-  float input_scale;
-  if (range == 0.0f) {
-    input_scale = 1.0f;
-    memset(input_quantized, 0, input_size * sizeof(int8_t));
-  } else {
-    input_scale = range / 127.0f;
-    const float inv_scale = 127.0f / range;
-    for (int i = 0; i < input_size; ++i) {
-      int32_t v = static_cast<int32_t>(input_data[i] * inv_scale +
-                  (input_data[i] >= 0.0f ? 0.5f : -0.5f));
-      v = v < -127 ? -127 : (v > 127 ? 127 : v);
-      input_quantized[i] = static_cast<int8_t>(v);
-    }
-  }
-
   const int output_depth = filter_shape.Dims(0);
   const int accum_depth = filter_shape.Dims(1);
   const int batches = input_size / accum_depth;
+
+  // Per-row symmetric quantization: each batch row gets its own scale.
+  // This matches LiteRT's BatchQuantizeFloats (symmetric mode).
+  float* input_scales = static_cast<float*>(
+      context->GetScratchBuffer(context, data.hybrid_scales_scratch_index));
+
+  for (int b = 0; b < batches; ++b) {
+    const float* row_data = input_data + b * accum_depth;
+    int8_t* row_quant = input_quantized + b * accum_depth;
+
+    float min_val = row_data[0];
+    float max_val = row_data[0];
+    for (int i = 1; i < accum_depth; ++i) {
+      if (row_data[i] < min_val) min_val = row_data[i];
+      if (row_data[i] > max_val) max_val = row_data[i];
+    }
+
+    const float range = std::max(std::abs(min_val), std::abs(max_val));
+    if (range == 0.0f) {
+      input_scales[b] = 1.0f;
+      memset(row_quant, 0, accum_depth * sizeof(int8_t));
+    } else {
+      input_scales[b] = range / 127.0f;
+      const float inv_scale = 127.0f / range;
+      for (int i = 0; i < accum_depth; ++i) {
+        int32_t v = static_cast<int32_t>(row_data[i] * inv_scale +
+                                         (row_data[i] >= 0.0f ? 0.5f : -0.5f));
+        v = v < -127 ? -127 : (v > 127 ? 127 : v);
+        row_quant[i] = static_cast<int8_t>(v);
+      }
+    }
+  }
+
+  const bool is_per_channel = (data.hybrid_num_channels == output_depth);
 
   FullyConnectedParams op_params = FullyConnectedParamsFloat(params.activation);
   const float act_min = op_params.float_activation_min;
   const float act_max = op_params.float_activation_max;
 
 #if defined(CMSIS_NN)
-  // CMSIS-NN accelerated path: int8 matmul with MVE/DSP acceleration
   int32_t* int32_output = static_cast<int32_t*>(
       context->GetScratchBuffer(context, data.hybrid_output_scratch_index));
-  memset(int32_output, 0, batches * output_depth * sizeof(int32_t));
-
-  arm_nn_mat_mult_nt_t_s8_s32(
-      input_quantized,  // lhs: [batches x accum_depth]
-      filter_int8,      // rhs: [output_depth x accum_depth]
-      int32_output,     // dst: [batches x output_depth]
-      batches,          // lhs_rows
-      accum_depth,      // rhs_rows
-      output_depth,     // rhs_cols
-      0,                // lhs_offset (symmetric quantization)
-      1);               // dst_idx_offset (contiguous)
 
   for (int b = 0; b < batches; ++b) {
+    memset(int32_output, 0, output_depth * sizeof(int32_t));
+
+    arm_nn_mat_mult_nt_t_s8_s32(input_quantized + b * accum_depth, filter_int8,
+                                int32_output, 1, accum_depth, output_depth, 0,
+                                1);
+
+    const float row_scale = input_scales[b];
     for (int out_c = 0; out_c < output_depth; ++out_c) {
-      float float_acc = int32_output[b * output_depth + out_c] *
-                        input_scale * data.hybrid_filter_scales[out_c];
+      const float filter_scale = is_per_channel
+                                     ? data.hybrid_filter_scales[out_c]
+                                     : data.hybrid_filter_scales[0];
+      float float_acc = int32_output[out_c] * row_scale * filter_scale;
       if (bias_float) {
         float_acc += bias_float[out_c];
       }
@@ -114,15 +121,18 @@ TfLiteStatus FullyConnectedEvalHybrid(
     }
   }
 #else
-  // Reference C fallback
   for (int b = 0; b < batches; ++b) {
+    const float row_scale = input_scales[b];
     for (int out_c = 0; out_c < output_depth; ++out_c) {
       int32_t acc = 0;
       for (int d = 0; d < accum_depth; ++d) {
         acc += static_cast<int32_t>(input_quantized[b * accum_depth + d]) *
                static_cast<int32_t>(filter_int8[out_c * accum_depth + d]);
       }
-      float float_acc = acc * input_scale * data.hybrid_filter_scales[out_c];
+      const float filter_scale = is_per_channel
+                                     ? data.hybrid_filter_scales[out_c]
+                                     : data.hybrid_filter_scales[0];
+      float float_acc = acc * row_scale * filter_scale;
       if (bias_float) {
         float_acc += bias_float[out_c];
       }

@@ -32,8 +32,8 @@ namespace {
 void* FullyConnectedInit(TfLiteContext* context, const char* buffer,
                          size_t length) {
   TFLITE_DCHECK(context->AllocatePersistentBuffer != nullptr);
-  void* raw = context->AllocatePersistentBuffer(context,
-                                                sizeof(OpDataFullyConnected));
+  void* raw =
+      context->AllocatePersistentBuffer(context, sizeof(OpDataFullyConnected));
   memset(raw, 0, sizeof(OpDataFullyConnected));
   return raw;
 }
@@ -64,8 +64,8 @@ TfLiteStatus FullyConnectedPrepare(TfLiteContext* context, TfLiteNode* node) {
   data->is_hybrid =
       (input->type == kTfLiteFloat32 && filter->type == kTfLiteInt8);
 
-  if ((input->type == kTfLiteFloat32 &&
-       filter->type != kTfLiteFloat32 && filter->type != kTfLiteInt8) ||
+  if ((input->type == kTfLiteFloat32 && filter->type != kTfLiteFloat32 &&
+       filter->type != kTfLiteInt8) ||
       (input->type == kTfLiteInt8 &&
        (filter->type != kTfLiteInt8 && filter->type != kTfLiteInt4)) ||
       (input->type == kTfLiteInt16 && filter->type != kTfLiteInt8)) {
@@ -94,8 +94,8 @@ TfLiteStatus FullyConnectedPrepare(TfLiteContext* context, TfLiteNode* node) {
         RuntimeShape(input->dims->size,
                      reinterpret_cast<const int32_t*>(input->dims->data))
             .FlatSize();
-    context->RequestScratchBufferInArena(
-        context, input_size * sizeof(int8_t), &data->hybrid_input_scratch_index);
+    context->RequestScratchBufferInArena(context, input_size * sizeof(int8_t),
+                                         &data->hybrid_input_scratch_index);
 
     data->hybrid_num_channels = aq->scale->size;
     float* scales_copy = static_cast<float*>(context->AllocatePersistentBuffer(
@@ -107,7 +107,11 @@ TfLiteStatus FullyConnectedPrepare(TfLiteContext* context, TfLiteNode* node) {
     // zero-point=0 quantization does not require filter row sums).
     data->hybrid_row_sums = nullptr;
 
-    // Allocate int32 output scratch for CMSIS-NN accelerated matmul
+    const int accum_depth = filter->dims->data[1];
+    const int batches = input_size / accum_depth;
+    TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
+        context, batches * sizeof(float), &data->hybrid_scales_scratch_index));
+
     const int output_size =
         RuntimeShape(output->dims->size,
                      reinterpret_cast<const int32_t*>(output->dims->data))

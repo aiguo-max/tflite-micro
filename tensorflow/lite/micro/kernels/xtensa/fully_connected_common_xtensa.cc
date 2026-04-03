@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <cstring>
+
 #include "tensorflow/lite/c/builtin_op_data.h"
 #include "tensorflow/lite/c/common.h"
 #include "tensorflow/lite/kernels/internal/common.h"
@@ -22,16 +24,14 @@ limitations under the License.
 #include "tensorflow/lite/micro/kernels/xtensa/xtensa.h"
 #include "tensorflow/lite/micro/kernels/xtensa/xtensa_fully_connected.h"
 
-#include <cstring>
-
 namespace tflite {
 
 void* XtensaInitFullyConnected(TfLiteContext* context, const char* buffer,
                                size_t length) {
   TFLITE_DCHECK(context->AllocatePersistentBuffer != nullptr);
 #if !defined(VISION_P6)
-  void* raw = context->AllocatePersistentBuffer(context,
-                                                sizeof(OpDataFullyConnected));
+  void* raw =
+      context->AllocatePersistentBuffer(context, sizeof(OpDataFullyConnected));
   memset(raw, 0, sizeof(OpDataFullyConnected));
   return raw;
 #else
@@ -110,7 +110,8 @@ TfLiteStatus XtensaPrepareFullyConnected(TfLiteContext* context,
   TF_LITE_ENSURE(context, output != nullptr);
   TF_LITE_ENSURE_TYPES_EQ(context, input->type, output->type);
 
-  data->is_hybrid = (input->type == kTfLiteFloat32 && filter->type == kTfLiteInt8);
+  data->is_hybrid =
+      (input->type == kTfLiteFloat32 && filter->type == kTfLiteInt8);
 
   if (filter->type == kTfLiteInt4) {
     int filter_size =
@@ -128,21 +129,29 @@ TfLiteStatus XtensaPrepareFullyConnected(TfLiteContext* context,
   int hybrid_input_size = 0;
   int hybrid_output_size = 0;
   int hybrid_num_channels = 0;
+  int hybrid_batches = 0;
   float* hybrid_filter_scales = nullptr;
   if (data->is_hybrid) {
-    const auto* aq = static_cast<TfLiteAffineQuantization*>(filter->quantization.params);
+    const auto* aq =
+        static_cast<TfLiteAffineQuantization*>(filter->quantization.params);
     TF_LITE_ENSURE(context, aq != nullptr);
     TF_LITE_ENSURE(context, aq->scale != nullptr);
     hybrid_num_channels = aq->scale->size;
-    hybrid_input_size = RuntimeShape(input->dims->size,
-                                     reinterpret_cast<const int32_t*>(input->dims->data))
-                            .FlatSize();
-    hybrid_output_size = RuntimeShape(output->dims->size,
-                                      reinterpret_cast<const int32_t*>(output->dims->data))
-                             .FlatSize();
-    hybrid_filter_scales = static_cast<float*>(
-        context->AllocatePersistentBuffer(context, aq->scale->size * sizeof(float)));
-    memcpy(hybrid_filter_scales, aq->scale->data, aq->scale->size * sizeof(float));
+    hybrid_input_size =
+        RuntimeShape(input->dims->size,
+                     reinterpret_cast<const int32_t*>(input->dims->data))
+            .FlatSize();
+    hybrid_output_size =
+        RuntimeShape(output->dims->size,
+                     reinterpret_cast<const int32_t*>(output->dims->data))
+            .FlatSize();
+    const int accum_depth = filter->dims->data[1];
+    hybrid_batches = hybrid_input_size / accum_depth;
+    hybrid_filter_scales =
+        static_cast<float*>(context->AllocatePersistentBuffer(
+            context, aq->scale->size * sizeof(float)));
+    memcpy(hybrid_filter_scales, aq->scale->data,
+           aq->scale->size * sizeof(float));
   }
 
   TFLITE_DCHECK_GE(GetTensorShape(output).DimensionsCount(), 1);
@@ -179,6 +188,9 @@ TfLiteStatus XtensaPrepareFullyConnected(TfLiteContext* context,
     TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
         context, hybrid_input_size * sizeof(int8_t),
         &data->hybrid_input_scratch_index));
+    TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
+        context, hybrid_batches * sizeof(float),
+        &data->hybrid_scales_scratch_index));
     TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
         context, hybrid_output_size * sizeof(int32_t),
         &data->hybrid_output_scratch_index));
