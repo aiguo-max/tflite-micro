@@ -90,14 +90,26 @@ TfLiteStatus FullyConnectedEvalHybridHifi(
   int32_t* acc_buf = static_cast<int32_t*>(
       context->GetScratchBuffer(context, data.hybrid_output_scratch_index));
 
-  int8_t s_zero_bias[512] = {};
+  alignas(8) int8_t s_zero_bias[512] = {};
 
   for (int b = 0; b < batches; ++b) {
     const int8_t* batch_input = input_quantized + b * accum_depth;
 
-    xa_nn_matXvec_8x8_32(acc_buf, const_cast<int8_t*>(filter_int8), nullptr,
-                         const_cast<int8_t*>(batch_input), nullptr, s_zero_bias,
-                         output_depth, accum_depth, 0, accum_depth, 0, 0, 0);
+    if ((accum_depth & 3) == 0) {
+      xa_nn_matXvec_8x8_32(acc_buf, const_cast<int8_t*>(filter_int8), nullptr,
+                           const_cast<int8_t*>(batch_input), nullptr,
+                           s_zero_bias, output_depth, accum_depth, 0,
+                           accum_depth, 0, 0, 0);
+    } else {
+      for (int r = 0; r < output_depth; ++r) {
+        int32_t acc = 0;
+        for (int d = 0; d < accum_depth; ++d) {
+          acc += static_cast<int32_t>(batch_input[d]) *
+                 static_cast<int32_t>(filter_int8[r * accum_depth + d]);
+        }
+        acc_buf[r] = acc;
+      }
+    }
 
     const float row_scale = input_scales[b];
     const bool is_per_channel = (data.hybrid_num_channels == output_depth);

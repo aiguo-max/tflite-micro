@@ -19,6 +19,9 @@ limitations under the License.
 
 #if defined(CMSIS_NN)
 #include "Include/arm_nnsupportfunctions.h"
+#elif defined(XTENSA) && defined(HIFI4)
+#include "xa_type_def.h"
+#include "xa_nnlib_kernels_api.h"
 #endif
 
 #include "tensorflow/lite/c/common.h"
@@ -38,7 +41,9 @@ namespace {
 //
 // Weight layout: [3*hidden, dim] with z/r/n gates stacked vertically.
 
+#if !(defined(XTENSA) && defined(HIFI4))
 static inline float Sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
+#endif
 
 static inline size_t AlignUp4(size_t v) { return (v + 3) & ~static_cast<size_t>(3); }
 
@@ -91,6 +96,29 @@ void HybridMatVec(int rows, int cols, const int8_t* matrix, float filter_scale,
   for (int i = 0; i < rows; ++i) {
     output[i] = static_cast<float>(acc_buf[i]) * combined_scale + bias[i];
   }
+#elif defined(XTENSA) && defined(HIFI4)
+  if ((cols & 3) == 0) {
+    alignas(8) int8_t zero_bias[192] = {};
+    xa_nn_matXvec_8x8_32(
+        acc_buf,
+        const_cast<int8_t*>(matrix), nullptr,
+        quantized_vec, nullptr,
+        zero_bias,
+        rows, cols, 0, cols, 0, 0, 0);
+    const float combined_scale = input_scale * filter_scale;
+    for (int i = 0; i < rows; ++i) {
+      output[i] = static_cast<float>(acc_buf[i]) * combined_scale + bias[i];
+    }
+  } else {
+    for (int i = 0; i < rows; ++i) {
+      int32_t acc = 0;
+      for (int j = 0; j < cols; ++j) {
+        acc += static_cast<int32_t>(quantized_vec[j]) *
+               static_cast<int32_t>(matrix[i * cols + j]);
+      }
+      output[i] = static_cast<float>(acc) * input_scale * filter_scale + bias[i];
+    }
+  }
 #else
   for (int i = 0; i < rows; ++i) {
     int32_t acc = 0;
@@ -106,6 +134,29 @@ void HybridMatVec(int rows, int cols, const int8_t* matrix, float filter_scale,
 void ApplyGruGates(int n_output, const float* scratch_xw,
                    const float* scratch_hw, const float* h_prev,
                    float* h_new) {
+#if defined(XTENSA) && defined(HIFI4)
+  constexpr int kMax = 64;
+  float tmp[kMax];
+  float z_vec[kMax];
+  float r_vec[kMax];
+  float n_vec[kMax];
+  // z = sigmoid(xw[0:h] + hw[0:h])
+  for (int i = 0; i < n_output; ++i)
+    tmp[i] = scratch_xw[i] + scratch_hw[i];
+  xa_nn_vec_sigmoid_f32_f32(z_vec, tmp, n_output);
+  // r = sigmoid(xw[h:2h] + hw[h:2h])
+  for (int i = 0; i < n_output; ++i)
+    tmp[i] = scratch_xw[n_output + i] + scratch_hw[n_output + i];
+  xa_nn_vec_sigmoid_f32_f32(r_vec, tmp, n_output);
+  // n = tanh(xw[2h:3h] + r * hw[2h:3h])
+  for (int i = 0; i < n_output; ++i)
+    tmp[i] = scratch_xw[2 * n_output + i] +
+             r_vec[i] * scratch_hw[2 * n_output + i];
+  xa_nn_vec_tanh_f32_f32(n_vec, tmp, n_output);
+  // h_new = (1 - z) * n + z * h_prev
+  for (int i = 0; i < n_output; ++i)
+    h_new[i] = (1.0f - z_vec[i]) * n_vec[i] + z_vec[i] * h_prev[i];
+#else
   for (int i = 0; i < n_output; ++i) {
     float z = Sigmoid(scratch_xw[i] + scratch_hw[i]);
     float r = Sigmoid(scratch_xw[n_output + i] + scratch_hw[n_output + i]);
@@ -113,6 +164,7 @@ void ApplyGruGates(int n_output, const float* scratch_xw,
                         r * scratch_hw[2 * n_output + i]);
     h_new[i] = (1.0f - z) * n + z * h_prev[i];
   }
+#endif
 }
 
 void GruCellStep(int n_input, int n_output, const float* input,
