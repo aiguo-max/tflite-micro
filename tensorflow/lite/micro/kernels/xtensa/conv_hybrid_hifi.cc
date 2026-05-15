@@ -71,7 +71,11 @@ TfLiteStatus ConvEvalHybridHifi(
   int8_t* im2col_buffer = static_cast<int8_t*>(
       context->GetScratchBuffer(context, data.hybrid_im2col_scratch_index));
 
-  // Dynamic quantization: symmetric quantize
+  // Asymmetric quantization matching TFLite HybridConvPerChannel semantics:
+  //   scale = (max(0, rmax) - min(0, rmin)) / 255
+  //   zp chosen as the endpoint with smaller rounding error
+  // The xa_nn_matXvec API has no lhs_offset parameter, so zp compensation
+  // happens externally via row_sums after the matmul.
   float min_val = input_data[0];
   float max_val = input_data[0];
   for (int i = 1; i < input_size; ++i) {
@@ -79,18 +83,31 @@ TfLiteStatus ConvEvalHybridHifi(
     if (input_data[i] > max_val) max_val = input_data[i];
   }
 
-  const float range = std::max(std::abs(min_val), std::abs(max_val));
+  const double rmin = std::min(0.0, static_cast<double>(min_val));
+  const double rmax = std::max(0.0, static_cast<double>(max_val));
   float input_scale;
-  if (range == 0.0f) {
+  int32_t input_zp;
+  if (rmin == rmax) {
     input_scale = 1.0f;
+    input_zp = 0;
     memset(input_quantized, 0, input_size * sizeof(int8_t));
   } else {
-    input_scale = range / 127.0f;
-    const float inv_scale = 127.0f / range;
+    const double scale = (rmax - rmin) / 255.0;
+    const double zp_from_min = -128.0 - rmin / scale;
+    const double zp_from_max = 127.0 - rmax / scale;
+    const double err_min = std::abs(-128.0) + std::abs(rmin / scale);
+    const double err_max = std::abs(127.0) + std::abs(rmax / scale);
+    const double zp_double = err_min < err_max ? zp_from_min : zp_from_max;
+    int32_t zp = static_cast<int32_t>(std::round(zp_double));
+    if (zp < -128) zp = -128;
+    if (zp > 127) zp = 127;
+    input_scale = static_cast<float>(scale);
+    input_zp = zp;
+    const float inv_scale = static_cast<float>(1.0 / scale);
     for (int i = 0; i < input_size; ++i) {
-      int32_t v = static_cast<int32_t>(input_data[i] * inv_scale +
-                  (input_data[i] >= 0.0f ? 0.5f : -0.5f));
-      v = v < -127 ? -127 : (v > 127 ? 127 : v);
+      int32_t v = static_cast<int32_t>(std::round(
+          static_cast<float>(zp) + input_data[i] * inv_scale));
+      v = v < -128 ? -128 : (v > 127 ? 127 : v);
       input_quantized[i] = static_cast<int8_t>(v);
     }
   }
@@ -139,13 +156,18 @@ TfLiteStatus ConvEvalHybridHifi(
                        batch_input + (in_y * input_width + in_x) * input_depth,
                        input_depth * sizeof(int8_t));
               } else {
+                // Padded positions represent 0.0 in float; quantized value of
+                // 0.0 is zp, so the row_sum-based compensation correctly cancels
+                // these contributions to acc.
                 memset(patch + (fy * filter_width + fx) * input_depth,
-                       0, input_depth * sizeof(int8_t));
+                       static_cast<int8_t>(input_zp),
+                       input_depth * sizeof(int8_t));
               }
             }
           } else {
             memset(patch + fy * filter_width * input_depth,
-                   0, filter_width * input_depth * sizeof(int8_t));
+                   static_cast<int8_t>(input_zp),
+                   filter_width * input_depth * sizeof(int8_t));
           }
         }
       }
@@ -195,11 +217,13 @@ TfLiteStatus ConvEvalHybridHifi(
 
       float* row_out = output_data +
           (batch * output_height + out_y) * output_width * output_depth;
+      const int32_t* row_sums = data.hybrid_row_sums;
       for (int x = 0; x < output_width; ++x) {
         const int32_t* acc = acc_buf + x * output_depth;
         float* out_ptr = row_out + x * output_depth;
         for (int c = 0; c < output_depth; ++c) {
-          float v = static_cast<float>(acc[c]) * combined_scales[c];
+          const int32_t acc_compensated = acc[c] - input_zp * row_sums[c];
+          float v = static_cast<float>(acc_compensated) * combined_scales[c];
           if (bias_float) v += bias_float[c];
           v = v < act_min ? act_min : (v > act_max ? act_max : v);
           out_ptr[c] = v;

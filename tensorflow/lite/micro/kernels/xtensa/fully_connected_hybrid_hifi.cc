@@ -51,8 +51,15 @@ TfLiteStatus FullyConnectedEvalHybridHifi(
   const int accum_depth = filter_shape.Dims(1);
   const int batches = input_size / accum_depth;
 
+  // Asymmetric per-batch activation quantization, matching TFLite's
+  // PortableAsymmetricQuantizeFloats + HybridConvPerChannel semantics:
+  //   scale = (max(0, rmax) - min(0, rmin)) / 255
+  //   zp chosen as the endpoint with smaller rounding error
+  //   acc_real = (q - zp) * w = q*w - zp*sum(w)
   float* input_scales = static_cast<float*>(
       context->GetScratchBuffer(context, data.hybrid_scales_scratch_index));
+  int32_t* input_zps = static_cast<int32_t*>(
+      context->GetScratchBuffer(context, data.hybrid_zero_points_scratch_index));
 
   for (int b = 0; b < batches; ++b) {
     const float* row_data = input_data + b * accum_depth;
@@ -65,17 +72,30 @@ TfLiteStatus FullyConnectedEvalHybridHifi(
       if (row_data[i] > max_val) max_val = row_data[i];
     }
 
-    const float range = std::max(std::abs(min_val), std::abs(max_val));
-    if (range == 0.0f) {
+    const double rmin = std::min(0.0, static_cast<double>(min_val));
+    const double rmax = std::max(0.0, static_cast<double>(max_val));
+    if (rmin == rmax) {
       input_scales[b] = 1.0f;
+      input_zps[b] = 0;
       memset(row_quant, 0, accum_depth * sizeof(int8_t));
     } else {
-      input_scales[b] = range / 127.0f;
-      const float inv_scale = 127.0f / range;
+      const double scale = (rmax - rmin) / 255.0;
+      const double zp_from_min = -128.0 - rmin / scale;
+      const double zp_from_max = 127.0 - rmax / scale;
+      const double err_min = std::abs(-128.0) + std::abs(rmin / scale);
+      const double err_max = std::abs(127.0) + std::abs(rmax / scale);
+      const double zp_double =
+          err_min < err_max ? zp_from_min : zp_from_max;
+      int32_t zp = static_cast<int32_t>(std::round(zp_double));
+      if (zp < -128) zp = -128;
+      if (zp > 127) zp = 127;
+      input_scales[b] = static_cast<float>(scale);
+      input_zps[b] = zp;
+      const float inv_scale = static_cast<float>(1.0 / scale);
       for (int i = 0; i < accum_depth; ++i) {
-        int32_t v = static_cast<int32_t>(row_data[i] * inv_scale +
-                                         (row_data[i] >= 0.0f ? 0.5f : -0.5f));
-        v = v < -127 ? -127 : (v > 127 ? 127 : v);
+        int32_t v = static_cast<int32_t>(std::round(
+            static_cast<float>(zp) + row_data[i] * inv_scale));
+        v = v < -128 ? -128 : (v > 127 ? 127 : v);
         row_quant[i] = static_cast<int8_t>(v);
       }
     }
@@ -91,6 +111,7 @@ TfLiteStatus FullyConnectedEvalHybridHifi(
       context->GetScratchBuffer(context, data.hybrid_output_scratch_index));
 
   alignas(8) int8_t s_zero_bias[512] = {};
+  const int32_t* row_sums = data.hybrid_row_sums;
 
   for (int b = 0; b < batches; ++b) {
     const int8_t* batch_input = input_quantized + b * accum_depth;
@@ -112,13 +133,14 @@ TfLiteStatus FullyConnectedEvalHybridHifi(
     }
 
     const float row_scale = input_scales[b];
+    const int32_t row_zp = input_zps[b];
     const bool is_per_channel = (data.hybrid_num_channels == output_depth);
     for (int out_c = 0; out_c < output_depth; ++out_c) {
       const float filter_scale = is_per_channel
                                      ? data.hybrid_filter_scales[out_c]
                                      : data.hybrid_filter_scales[0];
-      float float_acc =
-          static_cast<float>(acc_buf[out_c]) * row_scale * filter_scale;
+      const int32_t acc = acc_buf[out_c] - row_zp * row_sums[out_c];
+      float float_acc = static_cast<float>(acc) * row_scale * filter_scale;
       if (bias_float) {
         float_acc += bias_float[out_c];
       }

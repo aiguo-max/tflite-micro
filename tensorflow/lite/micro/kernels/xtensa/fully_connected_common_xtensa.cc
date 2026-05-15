@@ -131,6 +131,7 @@ TfLiteStatus XtensaPrepareFullyConnected(TfLiteContext* context,
   int hybrid_num_channels = 0;
   int hybrid_batches = 0;
   float* hybrid_filter_scales = nullptr;
+  int32_t* hybrid_row_sums = nullptr;
   if (data->is_hybrid) {
     const auto* aq =
         static_cast<TfLiteAffineQuantization*>(filter->quantization.params);
@@ -145,6 +146,7 @@ TfLiteStatus XtensaPrepareFullyConnected(TfLiteContext* context,
         RuntimeShape(output->dims->size,
                      reinterpret_cast<const int32_t*>(output->dims->data))
             .FlatSize();
+    const int output_depth = filter->dims->data[0];
     const int accum_depth = filter->dims->data[1];
     hybrid_batches = hybrid_input_size / accum_depth;
     hybrid_filter_scales =
@@ -152,6 +154,20 @@ TfLiteStatus XtensaPrepareFullyConnected(TfLiteContext* context,
             context, aq->scale->size * sizeof(float)));
     memcpy(hybrid_filter_scales, aq->scale->data,
            aq->scale->size * sizeof(float));
+
+    // Precompute per-channel filter row sums for asymmetric quant compensation:
+    //   acc_real = (q - zp) * w = q*w - zp*sum(w)
+    hybrid_row_sums = static_cast<int32_t*>(context->AllocatePersistentBuffer(
+        context, output_depth * sizeof(int32_t)));
+    const int8_t* filter_data =
+        reinterpret_cast<const int8_t*>(filter->data.data);
+    for (int c = 0; c < output_depth; ++c) {
+      int32_t s = 0;
+      for (int d = 0; d < accum_depth; ++d) {
+        s += static_cast<int32_t>(filter_data[c * accum_depth + d]);
+      }
+      hybrid_row_sums[c] = s;
+    }
   }
 
   TFLITE_DCHECK_GE(GetTensorShape(output).DimensionsCount(), 1);
@@ -192,11 +208,14 @@ TfLiteStatus XtensaPrepareFullyConnected(TfLiteContext* context,
         context, hybrid_batches * sizeof(float),
         &data->hybrid_scales_scratch_index));
     TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
+        context, hybrid_batches * sizeof(int32_t),
+        &data->hybrid_zero_points_scratch_index));
+    TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
         context, hybrid_output_size * sizeof(int32_t),
         &data->hybrid_output_scratch_index));
     data->hybrid_num_channels = hybrid_num_channels;
     data->hybrid_filter_scales = hybrid_filter_scales;
-    data->hybrid_row_sums = nullptr;
+    data->hybrid_row_sums = hybrid_row_sums;
   }
 
 #if defined(VISION_P6)
