@@ -125,8 +125,6 @@ TfLiteStatus ConvEvalHybridHifi(
   TF_LITE_ENSURE(context, output_depth <= 512);
   TF_LITE_ENSURE(context, output_width <= 256);
 
-  int32_t* acc_buf = static_cast<int32_t*>(
-      context->GetScratchBuffer(context, data.hybrid_output_scratch_index));
   int8_t s_zero_bias[512] = {};
 
   float combined_scales[512];
@@ -137,96 +135,114 @@ TfLiteStatus ConvEvalHybridHifi(
     combined_scales[c] = input_scale * filter_scale;
   }
 
+  const int tile_w = kHybridConvTileWidth;
+  const int32_t* row_sums = data.hybrid_row_sums;
+
   for (int batch = 0; batch < batches; ++batch) {
     const int8_t* batch_input = input_quantized + batch * input_height * input_width * input_depth;
 
     for (int out_y = 0; out_y < output_height; ++out_y) {
-      for (int out_x = 0; out_x < output_width; ++out_x) {
-        int8_t* patch = im2col_buffer + out_x * patch_size;
-
-        for (int fy = 0; fy < filter_height; ++fy) {
-          const int in_y = out_y * stride_height - pad_height +
-                           fy * dilation_height_factor;
-          if (in_y >= 0 && in_y < input_height) {
-            for (int fx = 0; fx < filter_width; ++fx) {
-              const int in_x = out_x * stride_width - pad_width +
-                               fx * dilation_width_factor;
-              if (in_x >= 0 && in_x < input_width) {
-                memcpy(patch + (fy * filter_width + fx) * input_depth,
-                       batch_input + (in_y * input_width + in_x) * input_depth,
-                       input_depth * sizeof(int8_t));
-              } else {
-                // Padded positions represent 0.0 in float; quantized value of
-                // 0.0 is zp, so the row_sum-based compensation correctly cancels
-                // these contributions to acc.
-                memset(patch + (fy * filter_width + fx) * input_depth,
-                       static_cast<int8_t>(input_zp),
-                       input_depth * sizeof(int8_t));
-              }
-            }
-          } else {
-            memset(patch + fy * filter_width * input_depth,
-                   static_cast<int8_t>(input_zp),
-                   filter_width * input_depth * sizeof(int8_t));
-          }
-        }
-      }
-
-      int8_t* vec_ptrs[256];
-      int32_t* out_ptrs[256];
-      for (int x = 0; x < output_width; ++x) {
-        vec_ptrs[x] = im2col_buffer + x * patch_size;
-        out_ptrs[x] = acc_buf + x * output_depth;
-      }
-
-      int vec_done = 0;
-      while (vec_done < output_width) {
-        int batch_count = output_width - vec_done;
-        if (batch_count >= 2 && (batch_count & 1)) batch_count--;
-        if (batch_count >= 2) {
-          xa_nn_matXvec_batch_8x8_32(
-              out_ptrs + vec_done,
-              const_cast<int8_t*>(filter_int8),
-              vec_ptrs + vec_done,
-              s_zero_bias,
-              output_depth,
-              patch_size,
-              patch_size,
-              0,
-              0,
-              batch_count);
-          vec_done += batch_count;
-        } else {
-          xa_nn_matXvec_8x8_32(
-              out_ptrs[vec_done],
-              const_cast<int8_t*>(filter_int8),
-              nullptr,
-              vec_ptrs[vec_done],
-              nullptr,
-              s_zero_bias,
-              output_depth,
-              patch_size,
-              0,
-              patch_size,
-              0,
-              0,
-              0);
-          vec_done++;
-        }
-      }
-
       float* row_out = output_data +
           (batch * output_height + out_y) * output_width * output_depth;
-      const int32_t* row_sums = data.hybrid_row_sums;
-      for (int x = 0; x < output_width; ++x) {
-        const int32_t* acc = acc_buf + x * output_depth;
-        float* out_ptr = row_out + x * output_depth;
-        for (int c = 0; c < output_depth; ++c) {
-          const int32_t acc_compensated = acc[c] - input_zp * row_sums[c];
-          float v = static_cast<float>(acc_compensated) * combined_scales[c];
-          if (bias_float) v += bias_float[c];
-          v = v < act_min ? act_min : (v > act_max ? act_max : v);
-          out_ptr[c] = v;
+
+      for (int tile_start = 0; tile_start < output_width; tile_start += tile_w) {
+        const int cur_tile = (tile_start + tile_w <= output_width)
+                                 ? tile_w
+                                 : (output_width - tile_start);
+
+        for (int t = 0; t < cur_tile; ++t) {
+          const int out_x = tile_start + t;
+          int8_t* patch = im2col_buffer + t * patch_size;
+
+          for (int fy = 0; fy < filter_height; ++fy) {
+            const int in_y = out_y * stride_height - pad_height +
+                             fy * dilation_height_factor;
+            if (in_y >= 0 && in_y < input_height) {
+              for (int fx = 0; fx < filter_width; ++fx) {
+                const int in_x = out_x * stride_width - pad_width +
+                                 fx * dilation_width_factor;
+                if (in_x >= 0 && in_x < input_width) {
+                  memcpy(patch + (fy * filter_width + fx) * input_depth,
+                         batch_input +
+                             (in_y * input_width + in_x) * input_depth,
+                         input_depth * sizeof(int8_t));
+                } else {
+                  // Padded positions represent 0.0 in float; quantized value of
+                  // 0.0 is zp, so (q - zp) = 0 contributes nothing to acc.
+                  memset(patch + (fy * filter_width + fx) * input_depth,
+                         static_cast<int8_t>(input_zp),
+                         input_depth * sizeof(int8_t));
+                }
+              }
+            } else {
+              memset(patch + fy * filter_width * input_depth,
+                     static_cast<int8_t>(input_zp),
+                     filter_width * input_depth * sizeof(int8_t));
+            }
+          }
+        }
+
+        // Reuse the output float buffer for this tile as int32 accumulator:
+        // sizeof(float) == sizeof(int32_t) == 4. The post-loop converts each
+        // int32 acc back to float in-place (forward iteration is safe because
+        // each 4-byte slot is read once as int32 and written once as float).
+        int32_t* tile_acc = reinterpret_cast<int32_t*>(
+            row_out + tile_start * output_depth);
+
+        int8_t* vec_ptrs[kHybridConvTileWidth];
+        int32_t* out_ptrs[kHybridConvTileWidth];
+        for (int t = 0; t < cur_tile; ++t) {
+          vec_ptrs[t] = im2col_buffer + t * patch_size;
+          out_ptrs[t] = tile_acc + t * output_depth;
+        }
+
+        int vec_done = 0;
+        while (vec_done < cur_tile) {
+          int batch_count = cur_tile - vec_done;
+          if (batch_count >= 2 && (batch_count & 1)) batch_count--;
+          if (batch_count >= 2) {
+            xa_nn_matXvec_batch_8x8_32(
+                out_ptrs + vec_done,
+                const_cast<int8_t*>(filter_int8),
+                vec_ptrs + vec_done,
+                s_zero_bias,
+                output_depth,
+                patch_size,
+                patch_size,
+                0,
+                0,
+                batch_count);
+            vec_done += batch_count;
+          } else {
+            xa_nn_matXvec_8x8_32(
+                out_ptrs[vec_done],
+                const_cast<int8_t*>(filter_int8),
+                nullptr,
+                vec_ptrs[vec_done],
+                nullptr,
+                s_zero_bias,
+                output_depth,
+                patch_size,
+                0,
+                patch_size,
+                0,
+                0,
+                0);
+            vec_done++;
+          }
+        }
+
+        for (int t = 0; t < cur_tile; ++t) {
+          float* out_ptr = row_out + (tile_start + t) * output_depth;
+          for (int c = 0; c < output_depth; ++c) {
+            int32_t acc_int32;
+            memcpy(&acc_int32, &out_ptr[c], sizeof(int32_t));
+            const int32_t acc_compensated = acc_int32 - input_zp * row_sums[c];
+            float v = static_cast<float>(acc_compensated) * combined_scales[c];
+            if (bias_float) v += bias_float[c];
+            v = v < act_min ? act_min : (v > act_max ? act_max : v);
+            out_ptr[c] = v;
+          }
         }
       }
     }
