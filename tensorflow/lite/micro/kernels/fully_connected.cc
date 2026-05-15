@@ -103,14 +103,30 @@ TfLiteStatus FullyConnectedPrepare(TfLiteContext* context, TfLiteNode* node) {
     memcpy(scales_copy, aq->scale->data, aq->scale->size * sizeof(float));
     data->hybrid_filter_scales = scales_copy;
 
-    // hybrid_row_sums is not used in any current Eval path (symmetric
-    // zero-point=0 quantization does not require filter row sums).
-    data->hybrid_row_sums = nullptr;
-
+    // Precompute per-channel filter row sums for asymmetric quant compensation:
+    //   acc_real = (q - zp) * w = q*w - zp*sum(w)
+    const int output_depth = filter->dims->data[0];
     const int accum_depth = filter->dims->data[1];
+    int32_t* row_sums =
+        static_cast<int32_t*>(context->AllocatePersistentBuffer(
+            context, output_depth * sizeof(int32_t)));
+    const int8_t* filter_data =
+        reinterpret_cast<const int8_t*>(filter->data.data);
+    for (int c = 0; c < output_depth; ++c) {
+      int32_t s = 0;
+      for (int d = 0; d < accum_depth; ++d) {
+        s += static_cast<int32_t>(filter_data[c * accum_depth + d]);
+      }
+      row_sums[c] = s;
+    }
+    data->hybrid_row_sums = row_sums;
+
     const int batches = input_size / accum_depth;
     TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
         context, batches * sizeof(float), &data->hybrid_scales_scratch_index));
+    TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
+        context, batches * sizeof(int32_t),
+        &data->hybrid_zero_points_scratch_index));
 
     const int output_size =
         RuntimeShape(output->dims->size,

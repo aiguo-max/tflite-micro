@@ -161,7 +161,23 @@ TfLiteStatus Prepare(TfLiteContext* context, TfLiteNode* node) {
                                           aq->scale->size * sizeof(float)));
     memcpy(scales_copy, aq->scale->data, aq->scale->size * sizeof(float));
     data->reference_op_data.hybrid_filter_scales = scales_copy;
-    data->reference_op_data.hybrid_row_sums = nullptr;
+
+    const int output_depth = filter->dims->data[0];
+    const int patch_elems = filter->dims->data[1] * filter->dims->data[2] *
+                            filter->dims->data[3];
+    int32_t* row_sums =
+        static_cast<int32_t*>(context->AllocatePersistentBuffer(
+            context, output_depth * sizeof(int32_t)));
+    const int8_t* filter_data =
+        reinterpret_cast<const int8_t*>(filter->data.data);
+    for (int c = 0; c < output_depth; ++c) {
+      int32_t s = 0;
+      for (int k = 0; k < patch_elems; ++k) {
+        s += static_cast<int32_t>(filter_data[c * patch_elems + k]);
+      }
+      row_sums[c] = s;
+    }
+    data->reference_op_data.hybrid_row_sums = row_sums;
 
     const int patch_size = filter_dims.h * filter_dims.w * input_dims.c;
     const int tile_w = kHybridConvTileWidth;

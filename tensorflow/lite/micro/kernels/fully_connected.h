@@ -46,6 +46,7 @@ struct OpDataFullyConnected {
   int hybrid_input_scratch_index;
   int hybrid_output_scratch_index;
   int hybrid_scales_scratch_index;
+  int hybrid_zero_points_scratch_index;
   const float* hybrid_filter_scales;
   int hybrid_num_channels;
   const int32_t* hybrid_row_sums;

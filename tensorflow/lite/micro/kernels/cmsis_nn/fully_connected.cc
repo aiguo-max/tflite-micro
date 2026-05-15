@@ -138,13 +138,30 @@ TfLiteStatus Prepare(TfLiteContext* context, TfLiteNode* node) {
         context, aq->scale->size * sizeof(float)));
     memcpy(scales_copy, aq->scale->data, aq->scale->size * sizeof(float));
     data->reference_op_data.hybrid_filter_scales = scales_copy;
-    data->reference_op_data.hybrid_row_sums = nullptr;
 
+    const int output_depth = filter->dims->data[0];
     const int accum_depth = filter->dims->data[1];
+    int32_t* row_sums =
+        static_cast<int32_t*>(context->AllocatePersistentBuffer(
+            context, output_depth * sizeof(int32_t)));
+    const int8_t* filter_data =
+        reinterpret_cast<const int8_t*>(filter->data.data);
+    for (int c = 0; c < output_depth; ++c) {
+      int32_t s = 0;
+      for (int d = 0; d < accum_depth; ++d) {
+        s += static_cast<int32_t>(filter_data[c * accum_depth + d]);
+      }
+      row_sums[c] = s;
+    }
+    data->reference_op_data.hybrid_row_sums = row_sums;
+
     const int batches = input_size / accum_depth;
     TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
         context, batches * sizeof(float),
         &data->reference_op_data.hybrid_scales_scratch_index));
+    TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(
+        context, batches * sizeof(int32_t),
+        &data->reference_op_data.hybrid_zero_points_scratch_index));
 
     const int output_size = data->batches * data->output_depth;
     TF_LITE_ENSURE_STATUS(context->RequestScratchBufferInArena(

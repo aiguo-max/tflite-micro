@@ -53,6 +53,11 @@ TfLiteStatus ConvEvalHybrid(TfLiteContext* context,
   int8_t* input_quantized = static_cast<int8_t*>(
       context->GetScratchBuffer(context, data.hybrid_input_scratch_index));
 
+  // Asymmetric quantization matching TFLite HybridConvPerChannel semantics:
+  //   scale = (max(0, rmax) - min(0, rmin)) / 255
+  //   zp chosen as the endpoint with smaller rounding error
+  // The subsequent matmul operates on q * w; compensation is applied when
+  // converting int32 accumulator to float: acc_real = (q - zp) * w.
   float min_val = input_data[0];
   float max_val = input_data[0];
   for (int i = 1; i < input_size; ++i) {
@@ -60,18 +65,31 @@ TfLiteStatus ConvEvalHybrid(TfLiteContext* context,
     if (input_data[i] > max_val) max_val = input_data[i];
   }
 
-  const float range = std::max(std::abs(min_val), std::abs(max_val));
+  const double rmin = std::min(0.0f, min_val);
+  const double rmax = std::max(0.0f, max_val);
   float input_scale;
-  if (range == 0.0f) {
+  int32_t input_zp;
+  if (rmin == rmax) {
     input_scale = 1.0f;
+    input_zp = 0;
     memset(input_quantized, 0, input_size * sizeof(int8_t));
   } else {
-    input_scale = range / 127.0f;
-    const float inv_scale = 127.0f / range;
+    const double scale = (rmax - rmin) / 255.0;
+    const double zp_from_min = -128.0 - rmin / scale;
+    const double zp_from_max = 127.0 - rmax / scale;
+    const double err_min = std::abs(-128.0) + std::abs(rmin / scale);
+    const double err_max = std::abs(127.0) + std::abs(rmax / scale);
+    const double zp_double = err_min < err_max ? zp_from_min : zp_from_max;
+    int32_t zp = static_cast<int32_t>(std::round(zp_double));
+    if (zp < -128) zp = -128;
+    if (zp > 127) zp = 127;
+    input_scale = static_cast<float>(scale);
+    input_zp = zp;
+    const float inv_scale = static_cast<float>(1.0 / scale);
     for (int i = 0; i < input_size; ++i) {
-      int32_t v = static_cast<int32_t>(input_data[i] * inv_scale +
-                  (input_data[i] >= 0.0f ? 0.5f : -0.5f));
-      v = v < -127 ? -127 : (v > 127 ? 127 : v);
+      int32_t v = static_cast<int32_t>(std::round(
+          static_cast<float>(zp) + input_data[i] * inv_scale));
+      v = v < -128 ? -128 : (v > 127 ? 127 : v);
       input_quantized[i] = static_cast<int8_t>(v);
     }
   }
@@ -131,7 +149,10 @@ TfLiteStatus ConvEvalHybrid(TfLiteContext* context,
                            Offset(input_shape, batch, in_y, in_x, 0),
                        input_depth);
               } else {
-                memset(dst, 0, input_depth);
+                // Padded positions represent 0.0 in float; quantized value of 0.0
+                // is zp, so that (q + lhs_offset) = (zp + (-zp)) = 0 contributes
+                // nothing to the accumulator (matches padding semantics).
+                memset(dst, static_cast<int8_t>(input_zp), input_depth);
               }
             }
           }
@@ -145,7 +166,7 @@ TfLiteStatus ConvEvalHybrid(TfLiteContext* context,
         memset(tile_acc, 0, cur_tile * output_depth * sizeof(int32_t));
 
         arm_nn_mat_mult_nt_t_s8_s32(im2col, filter_int8, tile_acc, cur_tile,
-                                     patch_size, output_depth, 0, 1);
+                                     patch_size, output_depth, -input_zp, 1);
 
         // Convert int32 accumulator to float32 in-place (backwards to avoid
         // overwriting unread int32 values when sizeof matches).
@@ -184,7 +205,7 @@ TfLiteStatus ConvEvalHybrid(TfLiteContext* context,
                 if ((in_x >= 0) && (in_x < input_width) && (in_y >= 0) && (in_y < input_height)) {
                   int input_idx = Offset(input_shape, batch, in_y, in_x, in_channel);
                   int filter_idx = Offset(filter_shape, out_channel, filter_y, filter_x, in_channel);
-                  acc += static_cast<int32_t>(input_quantized[input_idx]) *
+                  acc += (static_cast<int32_t>(input_quantized[input_idx]) - input_zp) *
                          static_cast<int32_t>(filter_int8[filter_idx]);
                 }
               }
@@ -418,7 +439,23 @@ TfLiteStatus ConvPrepare(TfLiteContext* context, TfLiteNode* node) {
         context, aq->scale->size * sizeof(float)));
     memcpy(scales_copy, aq->scale->data, aq->scale->size * sizeof(float));
     data->hybrid_filter_scales = scales_copy;
-    data->hybrid_row_sums = nullptr;
+
+    const int output_depth = filter->dims->data[0];
+    const int patch_elems = filter->dims->data[1] * filter->dims->data[2] *
+                            filter->dims->data[3];
+    int32_t* row_sums =
+        static_cast<int32_t*>(context->AllocatePersistentBuffer(
+            context, output_depth * sizeof(int32_t)));
+    const int8_t* filter_data =
+        reinterpret_cast<const int8_t*>(filter->data.data);
+    for (int c = 0; c < output_depth; ++c) {
+      int32_t s = 0;
+      for (int k = 0; k < patch_elems; ++k) {
+        s += static_cast<int32_t>(filter_data[c * patch_elems + k]);
+      }
+      row_sums[c] = s;
+    }
+    data->hybrid_row_sums = row_sums;
 
     const int filter_h = filter->dims->data[1];
     const int filter_w = filter->dims->data[2];
